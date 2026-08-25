@@ -1,0 +1,78 @@
+[package]
+name = "rsdns"
+version = "0.1.0"
+edition = "2021"
+description = "A rule-driven standalone DNS server"
+license = "MIT"
+readme = "README.md"
+keywords = ["dns", "resolver", "server"]
+categories = ["network-programming"]
+
+[dependencies]
+ahash = { version = "0.8.12", default-features = false, features = ["std", "runtime-rng"] }
+aws-lc-rs = { version = "1.18", optional = true, default-features = false }
+libmimalloc-sys = { version = "0.1.49", default-features = false, features = ["extended"], optional = true }
+mimalloc = { version = "0.1.48", default-features = false, optional = true }
+tikv-jemallocator = { version = "0.7", default-features = false, optional = true }
+bytes = { version = "1.10.1", default-features = false, features = ["std"] }
+clap = { version = "4.6", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+fst = { version = "0.4.7", default-features = false }
+futures = { version = "0.3.32", default-features = false, features = ["std"] }
+hickory-net = { version = "0.26", default-features = false, features = ["tokio"] }
+hickory-proto = { version = "0.26", default-features = false }
+http-body-util = { version = "0.1", default-features = false }
+hyper = { version = "1.8", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["http1", "server-auto", "client-legacy", "tokio"] }
+log = { version = "0.4", default-features = false, features = ["std"] }
+moka = { version = "0.12", default-features = false, features = ["future"] }
+notify = { version = "8.2.0", default-features = false, features = ["macos_kqueue"] }
+parking_lot = { version = "0.12.5", default-features = false }
+rand = { version = "0.10", default-features = false, features = ["std", "std_rng"] }
+rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "ring"] }
+ring = { version = "0.17.14", default-features = false }
+rustls = { version = "0.23.37", default-features = false, features = ["std", "tls12"] }
+rustls-native-certs = { version = "0.8.3", default-features = false }
+rustls-pemfile = { version = "2.2.0", default-features = false, features = ["std"] }
+serde = { version = "1.0.227", default-features = false, features = ["std", "derive"] }
+serde_yaml = { version = "0.9.34", default-features = false }
+slog = { version = "2", default-features = false, features = ["max_level_trace", "release_max_level_debug"] }
+slog-async = { version = "2", default-features = false }
+slog-scope = { version = "4", default-features = false }
+slog-stdlog = { version = "4", default-features = false }
+socket2 = { version = "0.6", default-features = false }
+time = { version = "0.3", default-features = false, features = ["formatting", "local-offset", "std"] }
+tokio = { version = "1.49.0", default-features = false, features = ["io-std", "net", "signal", "sync", "time", "fs", "rt-multi-thread", "macros"] }
+url = { version = "2.5", default-features = false }
+x509-parser = { version = "0.18.1", default-features = false }
+
+[features]
+default = ["aws-lc-rs", "jemalloc"]
+mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
+jemalloc = ["dep:tikv-jemallocator"]
+ring = [
+  "rustls/ring",
+  "rcgen/ring",
+  "hickory-net/tls-ring",
+  "hickory-net/https-ring",
+  "hickory-net/h3-ring",
+]
+aws-lc-rs = [
+  "dep:aws-lc-rs",
+  "rustls/aws-lc-rs",
+  "rcgen/aws_lc_rs",
+  "hickory-net/tls-aws-lc-rs",
+  "hickory-net/https-aws-lc-rs",
+  "hickory-net/h3-aws-lc-rs",
+]
+
+[profile.release]
+opt-level = 3
+debug = false
+lto = true
+strip = true
+debug-assertions = false
+codegen-units = 1
+
+[profile.release-with-symbols]
+inherits = "release"
+strip = false

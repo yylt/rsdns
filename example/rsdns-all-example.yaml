@@ -1,0 +1,193 @@
+# rsdns example config — full feature set (plugin pipeline)
+# Usage: rsdns --config example/rsdns-all-example.yaml
+# (repo root is the rsdns crate root)
+#
+# Top-level sections: binds[] / groups[] / upstreams[] + plugin sections
+# (hosts / cache / rules / log / metrics).  Each plugin owns its own config
+# section and initializes from it.
+
+# Listen addresses: plain IP:port = UDP, tcp:// prefix = TCP
+binds:
+  - address: "0.0.0.0:14453"          # UDP
+  - address: "tcp://0.0.0.0:14453"    # TCP
+
+# Domain groups: name + optional domains list (inline or file:// sources).
+# file:// sources are watched and reloaded automatically on change.
+groups:
+  - name: ad
+    domains:
+      - doubleclick.net
+      - googlesyndication.com
+      - googleadservices.com
+    # file: /etc/rsdns/ad-block.txt   (reloaded automatically on change)
+  - name: intranet
+    domains:
+      - corp.internal
+      - lan
+  - name: foo
+    domains:
+      - foo.com
+      - foo.org
+  - name: cdn
+    domains:
+      - cloudflare.com
+    skip_cache: true
+    # skip_speed: true   # also skip the speed plugin's latency sorting
+
+# Upstream pools: named groups of servers.  mode: serial (default) |
+# parallel | random | round_robin.
+# cooldown (optional, per group): "<window>:<errors>:<cooldown>", e.g.
+# "1m:10:10s" = if a server fails 10 times within a 1-minute window, cool it
+# down for 10 seconds (skipped during queries).
+# IP-address servers are used directly and also serve as the bootstrap
+# resolvers for domain-address servers (which are resolved at startup and
+# use all resolved A+AAAA addresses).
+# server_name overrides the TLS SNI / certificate name for DoT/DoH/DoH3/DoQ
+# (defaults to the address host when absent).
+upstreams:
+  - name: bootstrap
+    mode: serial
+    servers:
+      - address: 223.5.5.5
+  - name: default
+    mode: round_robin
+    cooldown: "1m:10:10s"
+    servers:
+      - address: tls://dot.pub           # TLS — domain resolved via IP servers, all A+AAAA IPs used
+        server_name: dns.alidns.com
+        pool:
+          # DoT benefits most from multiple long-lived connections.
+          max_size: 8
+          prefer_family: ipv4
+          connect_timeout: 3
+      - address: https://dns.quad9.net/dns-query  # DoH — domain resolved via IP servers
+        pool:
+          # DoH already multiplexes over HTTP/2; keep the pool small.
+          max_size: 4
+      - address: tls://1.1.1.1           # TLS with static IP
+  - name: overseas
+    mode: parallel
+    servers:
+      - address: tls://8.8.8.8
+      - address: https://cloudflare-dns.com/dns-query
+      - address: h3://mozilla.cloudflare-dns.com/dns-query  # DNS-over-HTTP/3
+      - address: quic://dns.adguard.com  # DNS-over-QUIC
+
+# Cache configuration
+cache:
+  size: 4096                       # LRU capacity
+  min_ttl: 60                      # clamp TTL lower bound (seconds)
+  max_ttl: 3600                    # clamp TTL upper bound (seconds)
+  keep_ttl: false                  # global default: clamp TTL
+
+# Hosts: suffix-matched static IP mapping (supports file: prefix and wildcard).
+# Two line formats:
+#   IP domain [domain...]                       → static IP mapping
+#   original_domain alias1 alias2 ...           → aliases: querying an alias
+#     answers under the queried name with the original domain's IP; when the
+#     original domain has no IP mapping, the query continues through the
+#     pipeline rewritten to the original domain (answered under the queried name).
+hosts:
+  - "127.0.0.1 localhost"
+  - "::1       localhost"
+  - "192.168.1.1 router.lan"
+  - "0.0.0.0 ad-domain.com"        # exact + all subdomains → 0.0.0.0
+  - "edge.example.com cdn1.example.com cdn2.example.com"   # alias line
+  - "file:/etc/hosts"
+
+# Rules: matched in order, first hit stops.
+# match syntax (no backward compat):
+#   (empty)         → match all
+#   group:{name}    → group reference
+#   {a.com,b.com}   → inline domain set (no braces, comma separated)
+rules:
+  # Block ad group with poison (A=0.0.0.0, AAAA=::)
+  - match: "group:ad"
+    action:
+      type: block
+      response: poison
+
+  # Block with NXDOMAIN
+  - match: "banned.example"
+    qtype: A
+    action:
+      type: block
+      response: nxdomain
+
+  # CNAME rewrite: resolve target via upstream and return its IP
+  - match: "group:foo"
+    qtype: ANY
+    action:
+      type: cname
+      target: site.182682.xyz
+      ttl: 600
+      upstream: default
+
+  # Forward intranet to default upstream, skip cache (group skip_cache)
+  - match: "group:intranet"
+    action:
+      type: forward
+      upstream: default
+
+  # Forward to overseas upstream with custom TTL
+  - match: "google.com"
+    qtype: A
+    action:
+      type: forward
+      upstream: overseas
+      ttl: 60       # rewrite response TTL to 60s
+      max_answers: 5   # cap returned answers (default 5; 0 = no limit)
+
+  # Forward a CDN group's subdomains (inline suffix match:
+  # cdn.cloudflare.com and below)
+  - match: "cdn.cloudflare.com"
+    action:
+      type: forward
+      upstream: default
+
+  # Rewrite: synthesize an A record for the query name, no upstream query.
+  # target is a literal dotted-quad IPv4 or a placeholder template filled
+  # from the match captures (each capture = one octet).
+  #   match "{1}.32.0.2.example.com" + target "{1}.32.0.2" → A <cap1>.32.0.2
+  #   match "{1}.example.com"        + target "10.10.0.0" → A 10.10.0.0
+  - match: "{1}.32.0.2.example.com"
+    qtype: A
+    action:
+      type: rewrite
+      target: "{1}.32.0.2"
+      ttl: 300
+
+  # Default catch-all
+  - match: ""
+    action:
+      type: forward
+      upstream: default
+      deny_qtypes: ["HTTPS"]
+
+# Query log (optional): per-query access log with template placeholders.
+# Placeholders: {type} {name} {proto} {remote} {action} {port} {size} {duration} {rcode} {answers}
+# Output is always stdout (written directly via tokio async I/O); no file or flush settings.
+log:
+  format: '{remote}:{port} {name} [{type}] {rcode} {action} {duration}'
+
+# Speed plugin (optional): latency-orders A/AAAA answers by TCP connect RTT.
+# Disabled by default — set enable: true to turn it on.
+#   type:          probe type, "syn" (default)
+#   port:          probe destination port, 443 (default)
+#   family:        record family to sort: ANY (default) / A / AAAA; a query
+#                  type only participates when it matches (A matches A/ANY,
+#                  AAAA matches AAAA/ANY)
+#   timeout:       per-IP probe timeout (bare number = seconds, or "500ms")
+speed:
+  enable: false
+  type: syn
+  port: 443
+  family: ANY
+  timeout: 1s
+
+# Prometheus metrics endpoint (optional).  Registered metrics:
+#   rsdns_logs_*, rsdns_hosts_*, rsdns_groups_*, rsdns_cache_*,
+#   rsdns_rules_*, rsdns_upstream_*, rsdns_upstream_pool_*
+metrics:
+  bind: "0.0.0.0:9153"
+  path: /metrics

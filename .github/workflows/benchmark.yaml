@@ -1,0 +1,146 @@
+name: benchmark
+
+# rsdns PR 性能基准流水线
+#
+# 在 PR 中对 rsdns 做并发性能测试，对比 UDP / DoT / DoH / DoH3 四种上游格式。
+# 设计文档: docs/design/2026-08-20-rsdns-benchmark.md
+# 具体逻辑: tests/benchmark/run_rsdns_benchmark.sh
+#
+# 说明:
+#   - 刻意不使用 Swatinem/rust-cache 等缓存 action，保证每次都是干净构建，
+#     避免缓存命中掩盖构建/依赖变化对性能的影响。
+#   - 查询路径通过 cache.size: 0（moka 容量为 0 时 map 整体禁用）彻底去除缓存。
+#   - 结果以 PR 评论 + Job 摘要 + Artifact(JSON/CSV) 三路交付。
+
+on:
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/benchmark.yaml"
+      - "tests/benchmark/**"
+  workflow_dispatch:
+    inputs:
+      concurrency:
+        description: "dnspyre 并发数（--concurrency）"
+        required: false
+        default: "64"
+      duration:
+        description: "每个协议的压测时长，如 30s / 1m"
+        required: false
+        default: "30s"
+      protocols:
+        description: "要测试的上游协议，逗号分隔（udp,tcp,dot,doh,doh3,quic）"
+        required: false
+        default: "udp,tcp,dot,doh,doh3,quic"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  RSDNS_PORT: 15353
+  BENCH_DURATION: ${{ inputs.duration || '30s' }}
+  BENCH_CONCURRENCY: ${{ inputs.concurrency || '64' }}
+  BENCH_PROTOCOLS: ${{ inputs.protocols || 'udp,tcp,dot,doh,doh3,quic' }}
+  DNSPYRE_VERSION: v3.12.0
+  ARTIFACT_DIR: benchmark-results
+
+jobs:
+  benchmark:
+    name: rsdns benchmark for many protocols
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      pull-requests: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dnspyre
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/bin"
+          curl -fsSL --retry 3 \
+            "https://github.com/Tantalor93/dnspyre/releases/download/${DNSPYRE_VERSION}/dnspyre_linux_amd64.tar.gz" \
+            -o /tmp/dnspyre.tar.gz
+          tar -xzf /tmp/dnspyre.tar.gz -C "$HOME/bin"
+          chmod +x "$HOME/bin/dnspyre"
+          "$HOME/bin/dnspyre" --help >/dev/null
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+        env:
+          DNSPYRE_VERSION: ${{ env.DNSPYRE_VERSION }}
+
+      - name: Build rsdns (release, no cache)
+        run: cargo build --release
+
+      - name: Fetch benchmark domain list
+        run: |
+          curl -fsSL --retry 3 \
+            "https://raw.githubusercontent.com/Tantalor93/dnspyre/master/data/1000-domains" \
+            -o domains.txt
+          wc -l domains.txt
+
+      - name: Run benchmarks
+        id: bench
+        run: |
+          ./tests/benchmark/run_rsdns_benchmark.sh \
+            --rsdns ./target/release/rsdns \
+            --dnspyre "$HOME/bin/dnspyre" \
+            --domains domains.txt \
+            --duration "$BENCH_DURATION" \
+            --concurrency "$BENCH_CONCURRENCY" \
+            --protocols "$BENCH_PROTOCOLS" \
+            --port "$RSDNS_PORT" \
+            --outdir "$ARTIFACT_DIR" > summary.md
+          echo "summary<<EOF" >> "$GITHUB_OUTPUT"
+          cat summary.md >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Publish job summary
+        if: always()
+        run: |
+          cat summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment results on PR
+        if: ${{ github.event_name == 'pull_request' && always() }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = process.env.BENCH_SUMMARY;
+            const label = "rsdns-benchmark";
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const old = comments.find((c) => c.body && c.body.startsWith(`<!-- ${label} -->`));
+            if (old) {
+              await github.rest.issues.deleteComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: old.id,
+              });
+            }
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `<!-- ${label} -->\n${body}`,
+            });
+        env:
+          BENCH_SUMMARY: ${{ steps.bench.outputs.summary }}
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rsdns-benchmark-results
+          path: ${{ env.ARTIFACT_DIR }}
+          retention-days: 7

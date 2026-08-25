@@ -1,0 +1,24 @@
+# Example systemd unit for rsdns.
+#
+# Type=notify: systemd waits until rsdns sends READY=1 over $NOTIFY_SOCKET
+# (after all UDP/TCP listeners and the metrics endpoint are bound), then
+# marks the service active.  Without systemd (no $NOTIFY_SOCKET) rsdns runs
+# as usual and the notification is skipped.
+#
+# Install:
+#   sudo cp example/rsdns.service /etc/systemd/system/rsdns.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now rsdns
+
+[Unit]
+Description=rsdns DNS server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/rsdns --config /etc/rsdns/rsdns.yaml
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

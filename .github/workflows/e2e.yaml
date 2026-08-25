@@ -1,0 +1,45 @@
+name: E2E
+
+on:
+  push:
+    branches: ["main"]
+    paths-ignore:
+      - "*.md"
+      - "docs/**"
+  pull_request:
+    branches: ["main"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e-rsdns:
+    name: E2E rsdns
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: "tests/e2e/go.mod"
+
+      - name: Build rsdns
+        run: cargo build
+
+      - name: Run rsdns E2E tests
+        env:
+          RSDNS_UPSTREAM_DOT: "tls://1.1.1.1:853"
+          RSDNS_UPSTREAM_DOH: "https://1.1.1.1/dns-query"
+          RSDNS_UPSTREAM_DOH3: "h3://1.1.1.1/dns-query"
+          RSDNS_UPSTREAM_TCP: "tcp://1.1.1.1:53"
+          RSDNS_UPSTREAM_DOQ: ""
+        run: ./tests/e2e/run_rsdns_tests.sh

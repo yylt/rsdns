@@ -1,0 +1,103 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BIN_NAME: "rsdns"
+
+jobs:
+  build:
+    name: Build - ${{ matrix.platform.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: Linux x86_64
+            target: x86_64-unknown-linux-musl
+            builder: cargo
+            artifact-dir: release
+            build-args: "--release"
+
+          - name: Linux aarch64
+            target: aarch64-unknown-linux-musl
+            builder: cross
+            artifact-dir: release
+            build-args: "--release -vv"
+
+    steps:
+      - name: Checkout Git repo
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install musl-tools
+        if: matrix.platform.builder == 'cargo'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools pkg-config
+
+      - name: Install cross
+        if: matrix.platform.builder == 'cross'
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build with cargo
+        if: matrix.platform.builder == 'cargo'
+        env:
+          JEMALLOC_SYS_WITH_LG_PAGE: ${{ contains(matrix.platform.target, 'aarch64') && '14' || '12' }}
+        run: |
+          cargo build ${{ matrix.platform.build-args }} --bin ${{ env.BIN_NAME }} --target ${{ matrix.platform.target }}
+
+      - name: Build with cross
+        if: matrix.platform.builder == 'cross'
+        env:
+          JEMALLOC_SYS_WITH_LG_PAGE: ${{ contains(matrix.platform.target, 'aarch64') && '14' || '12' }}
+        run: |
+          cross build ${{ matrix.platform.build-args }} --bin ${{ env.BIN_NAME }} --target ${{ matrix.platform.target }}
+
+      - name: Package release artifacts
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.platform.target }}/${{ matrix.platform.artifact-dir }}/${{ env.BIN_NAME }} dist/${{ env.BIN_NAME }}-${{ matrix.platform.target }}
+          tar -C dist -czf dist/${{ env.BIN_NAME }}-${{ matrix.platform.target }}.tar.gz ${{ env.BIN_NAME }}-${{ matrix.platform.target }}
+
+      - name: Store rsdns artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BIN_NAME }}-${{ matrix.platform.target }}
+          path: dist/${{ env.BIN_NAME }}-${{ matrix.platform.target }}.tar.gz
+          retention-days: 1
+
+  release:
+    name: Release
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout Git repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.RELEASE_TOKEN }}
+          files: |
+            artifacts/**/${{ env.BIN_NAME }}-*.tar.gz
