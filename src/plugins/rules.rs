@@ -13,7 +13,9 @@
 //!   `resolve_cname: true` resolves the target when the response's first
 //!   answer is a CNAME (only the last CNAME of a pure CNAME chain is
 //!   resolved; A/AAAA replaces it with owner = queried name, empty drops
-//!   it and stops, CNAME keeps the original response);
+//!   it and stops, CNAME keeps the original response); `edns: "cidr"` adds
+//!   an EDNS Client Subnet (RFC 7871) option to every query this rule
+//!   sends (including `resolve_cname` follow-ups);
 //! - `rewrite` → **terminal**: synthesize an A record for the query name
 //!   from the `target` (literal dotted-quad IPv4 or `{N}` placeholder
 //!   template filled from the match captures, e.g. `{1}.32.0.2`), `Respond`
@@ -31,8 +33,10 @@
 //! rule action (e.g. `cname.target: "{1}.cdn.example.com"`).
 
 use std::io;
+use std::str::FromStr;
 
 use hickory_proto::op::Message;
+use hickory_proto::rr::rdata::opt::ClientSubnet;
 use hickory_proto::rr::rdata::{A, CNAME};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use log::warn;
@@ -200,6 +204,8 @@ pub enum RuleAction {
         max_answers: usize,
         deny_qtypes: Vec<RecordType>,
         resolve_cname: bool,
+        /// Fixed EDNS Client Subnet advertised to the upstream (RFC 7871).
+        subnet: Option<ClientSubnet>,
     },
     Rewrite {
         target: String,
@@ -450,12 +456,14 @@ pub fn init(config: &Config, registry: &MetricsRegistry, upstreams: Arc<crate::u
                 max_answers,
                 deny_qtypes,
                 resolve_cname,
+                edns,
             } => RuleAction::Forward {
                 upstream: upstream.clone(),
                 ttl: *ttl,
                 max_answers: max_answers.unwrap_or(5),
                 deny_qtypes: deny_qtypes.iter().map(|qt| parse_qtype(qt)).collect(),
                 resolve_cname: *resolve_cname,
+                subnet: parse_rule_edns(edns.as_deref()),
             },
             RuleActionConfig::Rewrite { target, ttl } => RuleAction::Rewrite {
                 target: target.clone(),
@@ -480,6 +488,21 @@ fn parse_qtype(s: &str) -> hickory_proto::rr::RecordType {
         .parse::<hickory_proto::rr::RecordType>()
         .or_else(|_| s.parse::<u16>().map(RecordType::from))
         .unwrap_or_else(|_| panic!("invalid query type: {s}"))
+}
+
+/// Parses the forward rule's `edns` CIDR into a [`ClientSubnet`]; an
+/// invalid CIDR logs a warning and disables ECS for that rule.
+fn parse_rule_edns(spec: Option<&str>) -> Option<ClientSubnet> {
+    match spec {
+        None => None,
+        Some(s) => match ClientSubnet::from_str(s.trim()) {
+            Ok(cs) => Some(cs),
+            Err(e) => {
+                warn!("rule forward edns: invalid CIDR {:?}: {}", s, e);
+                None
+            }
+        },
+    }
 }
 
 impl Rules {
@@ -589,6 +612,7 @@ impl Rules {
                 max_answers,
                 deny_qtypes,
                 resolve_cname,
+                subnet,
             } => {
                 if deny_qtypes.contains(&ctx.qtype()) {
                     let action_label = format!("forward-nodata({upstream})");
@@ -614,7 +638,7 @@ impl Rules {
                         m.matched_total.with_label_values(&["forward"]).inc();
                     }
                     match self
-                        .forward_query(ctx, upstream, *ttl, *max_answers, *resolve_cname)
+                        .forward_query(ctx, upstream, *ttl, *max_answers, *resolve_cname, *subnet)
                         .await
                     {
                         Ok(()) => Step::Respond,
@@ -659,11 +683,16 @@ impl Rules {
         ttl: Option<u32>,
         max_answers: usize,
         resolve_cname: bool,
+        subnet: Option<ClientSubnet>,
     ) -> io::Result<()> {
-        let resp = self.upstreams.query(upstream, &ctx.msg).await?;
+        let mut msg = ctx.msg.clone();
+        if let Some(subnet) = subnet {
+            crate::upstream::apply_edns(&mut msg, &subnet);
+        }
+        let resp = self.upstreams.query(upstream, &msg).await?;
         let mut resp = resp;
         if resolve_cname {
-            self.resolve_cnames(ctx, upstream, &mut resp).await;
+            self.resolve_cnames(ctx, upstream, &mut resp, subnet).await;
         }
         if let Some(ttl) = ttl {
             rewrite_ttl_in_response(&mut resp, ttl);
@@ -681,7 +710,13 @@ impl Rules {
     /// 最后一个 target，跳过多级中间链。解析返回 A/AAAA → 用其替换整条 CNAME
     /// 链（owner 改写为原查询名.
     /// 返回空 / 返回 CNAME / 其他类型 / 解析出错 → 原样保留当前响应并结束（不追链）。
-    async fn resolve_cnames(&self, ctx: &QueryContext, upstream: &str, resp: &mut Message) {
+    async fn resolve_cnames(
+        &self,
+        ctx: &QueryContext,
+        upstream: &str,
+        resp: &mut Message,
+        subnet: Option<ClientSubnet>,
+    ) {
         let Some(idx) = last_cname_index(&resp.answers) else {
             return;
         };
@@ -689,13 +724,16 @@ impl Rules {
             return;
         };
         let target = cname.0.to_utf8();
-        let target_msg = match make_query_msg(&target, ctx.qtype()) {
+        let mut target_msg = match make_query_msg(&target, ctx.qtype()) {
             Ok(msg) => msg,
             Err(e) => {
                 warn!("resolve_cname target {} for {} invalid: {}", target, ctx.name(), e);
                 return;
             }
         };
+        if let Some(subnet) = subnet {
+            crate::upstream::apply_edns(&mut target_msg, &subnet);
+        }
         let resolved = match self.upstreams.query(upstream, &target_msg).await {
             Ok(resp) => resp,
             Err(e) => {
@@ -835,6 +873,18 @@ mod tests {
 
     fn parse_ok(s: &str) -> MatchTarget {
         parse_match_target(s).unwrap()
+    }
+
+    #[test]
+    fn test_parse_rule_edns() {
+        // Valid CIDR → parsed subnet.
+        let cs = parse_rule_edns(Some("203.0.113.0/24")).expect("valid CIDR parses");
+        assert_eq!(cs.addr(), std::net::IpAddr::V4(Ipv4Addr::new(203, 0, 113, 0)));
+        assert_eq!(cs.source_prefix(), 24);
+        // Absent → None.
+        assert!(parse_rule_edns(None).is_none());
+        // Invalid CIDR → None (warning logged, ECS disabled for the rule).
+        assert!(parse_rule_edns(Some("not-a-cidr")).is_none());
     }
 
     #[test]

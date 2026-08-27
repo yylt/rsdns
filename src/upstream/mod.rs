@@ -71,7 +71,8 @@ use ahash::AHashMap;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use hickory_net::xfer::{DnsHandle, FirstAnswer};
-use hickory_proto::op::{DnsRequest, DnsRequestOptions, Message};
+use hickory_proto::op::{DnsRequest, DnsRequestOptions, Edns, Message};
+use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsCode, EdnsOption};
 use log::{info, warn};
 use parking_lot::Mutex;
 use rand::seq::SliceRandom;
@@ -137,6 +138,23 @@ impl UpstreamClient {
                 Err(err)
             }
         }
+    }
+}
+
+/// Inserts the EDNS Client Subnet option into `msg` if not already present.
+///
+/// When `msg` carries no EDNS OPT record yet, one is created with hickory's
+/// defaults and the option is inserted; an existing OPT record is left
+/// untouched apart from the inserted option.
+pub(crate) fn apply_edns(msg: &mut Message, subnet: &ClientSubnet) {
+    let Some(edns) = msg.edns.as_mut() else {
+        let mut edns = Edns::default();
+        edns.options_mut().insert(EdnsOption::Subnet(*subnet));
+        msg.set_edns(edns);
+        return;
+    };
+    if edns.option(EdnsCode::Subnet).is_none() {
+        edns.options_mut().insert(EdnsOption::Subnet(*subnet));
     }
 }
 
@@ -828,6 +846,10 @@ pub async fn init(config: &Config, registry: &MetricsRegistry) -> Result<Arc<Ups
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugins::util::make_query_msg;
+    use hickory_proto::rr::RecordType;
+    use std::net::IpAddr;
+    use std::str::FromStr;
     use std::time::Duration;
 
     #[test]
@@ -1031,5 +1053,50 @@ mod tests {
     fn client() -> UpstreamClient {
         let pool = ConnectionPool::with_proto(vec![], factory::udp_factory(), Default::default(), "udp");
         UpstreamClient::new(pool)
+    }
+
+    fn subnet(s: &str) -> ClientSubnet {
+        ClientSubnet::from_str(s).unwrap()
+    }
+
+    #[test]
+    fn test_apply_edns_adds_subnet_option() {
+        let mut msg = make_query_msg("example.com", RecordType::A).unwrap();
+        assert!(msg.edns.is_none());
+        apply_edns(&mut msg, &subnet("203.0.113.0/24"));
+        let edns = msg.edns.as_ref().expect("edns set");
+        let EdnsOption::Subnet(cs) = edns.option(EdnsCode::Subnet).expect("subnet option") else {
+            panic!("expected Subnet option");
+        };
+        assert_eq!(cs.addr(), IpAddr::from([203, 0, 113, 0]));
+        assert_eq!(cs.source_prefix(), 24);
+        assert_eq!(cs.scope_prefix(), 0);
+    }
+
+    #[test]
+    fn test_apply_edns_preserves_existing_options() {
+        let mut msg = make_query_msg("example.com", RecordType::A).unwrap();
+        let mut edns = Edns::default();
+        edns.set_max_payload(1400);
+        edns.set_dnssec_ok(true);
+        msg.set_edns(edns);
+        apply_edns(&mut msg, &subnet("2001:db8::/32"));
+        let edns = msg.edns.as_ref().unwrap();
+        assert_eq!(edns.max_payload(), 1400);
+        assert!(edns.flags().dnssec_ok);
+        let EdnsOption::Subnet(cs) = edns.option(EdnsCode::Subnet).expect("subnet option") else {
+            panic!("expected Subnet option");
+        };
+        assert_eq!(cs.addr(), IpAddr::from_str("2001:db8::").unwrap());
+        assert_eq!(cs.source_prefix(), 32);
+    }
+
+    #[test]
+    fn test_apply_edns_does_not_duplicate() {
+        let mut msg = make_query_msg("example.com", RecordType::A).unwrap();
+        apply_edns(&mut msg, &subnet("10.0.0.0/8"));
+        apply_edns(&mut msg, &subnet("10.0.0.0/8"));
+        let edns = msg.edns.as_ref().unwrap();
+        assert_eq!(edns.options().get_all(EdnsCode::Subnet).len(), 1);
     }
 }

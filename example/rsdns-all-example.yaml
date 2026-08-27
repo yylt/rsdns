@@ -137,6 +137,7 @@ rules:
       upstream: overseas
       ttl: 60       # rewrite response TTL to 60s
       max_answers: 5   # cap returned answers (default 5; 0 = no limit)
+      edns: "203.0.113.0/24"   # 固定 EDNS Client Subnet (RFC 7871)，该规则的查询都通告此网段
 
   # Forward a CDN group's subdomains (inline suffix match:
   # cdn.cloudflare.com and below)
@@ -166,9 +167,17 @@ rules:
 
 # Query log (optional): per-query access log with template placeholders.
 # Placeholders: {type} {name} {proto} {remote} {action} {port} {size} {duration} {rcode} {answers}
-# Output is always stdout (written directly via tokio async I/O); no file or flush settings.
+#              {time} — query start time (wall-clock, local tz, DD/MM/YYYY:HH:MM:SS ±HHMM)
+# Output: stdout by default; set directory to write rotating files instead.
+#   directory: "{dir}:{maxsize}:{numfile}" — write to dir/query.log; when the
+#   active file reaches maxsize it is gzip-archived as query.log.N.gz and a
+#   fresh file starts; at most numfile files (active + archives) are kept.
+#   maxsize supports k/K/m/M/g/G suffixes (5m = 5 MB).  A bare directory path
+#   (e.g. "/var/log/rsdns") uses the default maxsize/numfile (5m / 5 files).
 log:
   format: '{remote}:{port} {name} [{type}] {rcode} {action} {duration}'
+  # directory: '/var/log/rsdns'           # bare path → 5m / 5 files
+  # directory: '/var/log/rsdns:2m:3'      # explicit rotation settings
 
 # Speed plugin (optional): latency-orders A/AAAA answers by TCP connect RTT.
 # Disabled by default — set enable: true to turn it on.

@@ -17,7 +17,7 @@
 use hickory_proto::op::Message;
 use hickory_proto::rr::RecordType;
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use super::plugins::cache::CacheKey;
 
@@ -46,8 +46,11 @@ pub struct QueryContext {
     pub client: SocketAddr,
     /// "udp" or "tcp".
     pub proto: &'static str,
-    /// When the query was received (set by the server before the pipeline).
+    /// When the query was received (monotonic, for `{duration}`).
     pub start: Instant,
+    /// When the query was received, wall-clock — aligned with system time
+    /// (for the `{time}` log placeholder).
+    pub start_time: SystemTime,
     /// Size of the original request in bytes (for query logging).
     pub size: usize,
 
@@ -94,6 +97,7 @@ impl QueryContext {
             client,
             proto,
             start,
+            start_time: SystemTime::now(),
             size,
             skip_log: false,
             skip_cache: false,
