@@ -16,6 +16,7 @@ pub fn bind_tcp_listener(addr: SocketAddr) -> std::io::Result<tokio::net::TcpLis
         tokio::net::TcpSocket::new_v4()?
     };
     socket.set_reuseaddr(true)?;
+    socket.set_nodelay(true)?;
     socket.bind(addr)?;
     socket.listen(DEFAULT_LISTEN_BACKLOG)
 }

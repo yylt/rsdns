@@ -234,6 +234,12 @@ pub enum RuleActionConfig {
         /// keeps the original response untouched (no further chaining).
         #[serde(default)]
         resolve_cname: bool,
+        /// Fixed EDNS Client Subnet (RFC 7871) advertised to the upstream,
+        /// as a CIDR string e.g. `203.0.113.0/24`.  Every query this
+        /// forward rule sends (including `resolve_cname` follow-ups)
+        /// carries the ECS option.  Omitted → no EDNS option is added.
+        #[serde(default)]
+        edns: Option<String>,
     },
     /// Rewrite the query with a synthesized IPv4 A answer (no upstream
     /// query).  `target` is a dotted-quad IPv4 (`10.10.0.0`) or a
@@ -267,10 +273,20 @@ fn default_block_response() -> BlockResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogConfig {
     /// Format template with placeholders: `{type}`, `{name}`, `{proto}`, `{remote}`,
-    /// `{action}`, `{port}`, `{size}`, `{duration}`, `{rcode}`.
+    /// `{action}`, `{port}`, `{size}`, `{duration}`, `{rcode}`, `{time}`.
+    /// `{time}` is the query start wall-clock time (local timezone).
     /// Default: `"{remote}:{port} {name} [{type}] {rcode} {duration}"`
     #[serde(default = "default_format")]
     pub format: String,
+
+    /// Log file directory in `{dir}:{maxsize}:{numfile}` form, e.g.
+    /// `/var/log/rsdns:5m:5` — write query logs to `dir/query.log`,
+    /// rotating (gzip) once the file reaches `maxsize` and keeping at most
+    /// `numfile` files (including the active one).  A bare directory path
+    /// (e.g. `/var/log/rsdns`) uses the default `maxsize`/`numfile`
+    /// (`5m` / `5`).  `None` (default) means stdout.
+    #[serde(default, alias = "dir", skip_serializing_if = "Option::is_none")]
+    pub directory: Option<String>,
 }
 
 fn default_format() -> String {
@@ -281,8 +297,92 @@ impl Default for LogConfig {
     fn default() -> Self {
         Self {
             format: default_format(),
+            directory: None,
         }
     }
+}
+
+/// Default `{dir}:{maxsize}:{numfile}` directory spec.
+pub const DEFAULT_LOG_DIRECTORY: &str = "/var/log/rsdns:5m:5";
+
+/// Default per-file size threshold (bytes) when `directory` omits `maxsize`.
+pub const DEFAULT_LOG_MAXSIZE: u64 = 5_000_000;
+
+/// Default number of files kept (including the active one) when `directory`
+/// omits `numfile`.
+pub const DEFAULT_LOG_NUMFILE: usize = 5;
+
+/// Parsed `{dir}:{maxsize}:{numfile}` query-log directory spec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogDirectory {
+    /// Output directory (created if missing).
+    pub dir: String,
+    /// Per-file size threshold in bytes before rotation.
+    pub maxsize: u64,
+    /// Number of files kept (including the active one), >= 1.
+    pub numfile: usize,
+}
+
+/// Parses a `{dir}:{maxsize}:{numfile}` spec (see [`DEFAULT_LOG_DIRECTORY`]),
+/// returning `None` for invalid specs.
+///
+/// A bare directory path (no `:` separators) is accepted and uses the
+/// default `maxsize` (`5m`) and `numfile` (`5`).  `maxsize` supports
+/// `k`/`K`, `m`/`M`, `g`/`G` suffixes (decimal powers: `5m` = 5_000_000
+/// bytes); a bare number is bytes.
+pub fn parse_log_directory_checked(spec: &str) -> Option<LogDirectory> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return None;
+    }
+    // 只给目录路径：轮转参数使用默认值。
+    if !spec.contains(':') {
+        return Some(LogDirectory {
+            dir: spec.to_string(),
+            maxsize: DEFAULT_LOG_MAXSIZE,
+            numfile: DEFAULT_LOG_NUMFILE,
+        });
+    }
+    let mut parts = spec.splitn(3, ':');
+    let dir = parts.next()?.trim().to_string();
+    let size = parts.next()?.trim();
+    let num = parts.next()?.trim();
+    if dir.is_empty() || size.is_empty() || num.is_empty() {
+        return None;
+    }
+    let maxsize = parse_size(size)?;
+    let numfile: usize = num.parse().ok()?;
+    if maxsize == 0 || numfile < 1 {
+        return None;
+    }
+    Some(LogDirectory { dir, maxsize, numfile })
+}
+
+/// The default directory spec: `dir=/var/log/rsdns`, `maxsize=5m`,
+/// `numfile=5`.
+pub fn default_log_directory() -> LogDirectory {
+    LogDirectory {
+        dir: "/var/log/rsdns".into(),
+        maxsize: DEFAULT_LOG_MAXSIZE,
+        numfile: DEFAULT_LOG_NUMFILE,
+    }
+}
+
+/// Parses a byte size: bare number = bytes, optional `k`/`K`/`m`/`M`/`g`/`G`
+/// suffix = decimal kilobytes/megabytes/gigabytes.
+fn parse_size(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (num, mult) = match s.as_bytes()[s.len() - 1] {
+        b'k' | b'K' => (&s[..s.len() - 1], 1_000u64),
+        b'm' | b'M' => (&s[..s.len() - 1], 1_000_000u64),
+        b'g' | b'G' => (&s[..s.len() - 1], 1_000_000_000u64),
+        _ => (s, 1u64),
+    };
+    let n: u64 = num.trim().parse().ok()?;
+    Some(n.saturating_mul(mult))
 }
 
 #[cfg(test)]
@@ -379,6 +479,28 @@ rules:
     }
 
     #[test]
+    fn test_forward_edns_parse() {
+        let yaml = r#"
+rules:
+  - match: ""
+    action: { type: forward, upstream: default, edns: "203.0.113.0/24" }
+  - match: ""
+    action: { type: forward, upstream: default }
+"#;
+        let config = Config::from_yaml_str(yaml).expect("parse failed");
+        let raw = config.plugin_sections.get("rules").cloned().unwrap();
+        let configs: Vec<RuleConfig> = serde_yaml::from_value(raw).unwrap();
+        match &configs[0].action {
+            RuleActionConfig::Forward { edns, .. } => assert_eq!(edns.as_deref(), Some("203.0.113.0/24")),
+            other => panic!("expected Forward, got {other:?}"),
+        }
+        match &configs[1].action {
+            RuleActionConfig::Forward { edns, .. } => assert!(edns.is_none(), "default must be None"),
+            other => panic!("expected Forward, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_unknown_top_level_keys_go_to_plugin_sections() {
         let yaml = r#"
 binds:
@@ -426,5 +548,62 @@ some_future_plugin:
         assert_eq!(pool.idle_timeout, defaults.idle_timeout);
         assert_eq!(pool.connect_timeout, defaults.connect_timeout);
         assert_eq!(pool.dns_timeout, defaults.dns_timeout);
+    }
+
+    #[test]
+    fn test_parse_log_directory_default() {
+        let ld = default_log_directory();
+        assert_eq!(ld.dir, "/var/log/rsdns");
+        assert_eq!(ld.maxsize, DEFAULT_LOG_MAXSIZE);
+        assert_eq!(ld.numfile, DEFAULT_LOG_NUMFILE);
+        // Parsing the literal default gives the same result.
+        assert_eq!(parse_log_directory_checked(DEFAULT_LOG_DIRECTORY), Some(ld.clone()));
+        // 只给目录路径 → 使用默认 maxsize/numfile。
+        assert_eq!(parse_log_directory_checked("/var/log/rsdns"), Some(ld));
+    }
+
+    #[test]
+    fn test_parse_log_directory_units() {
+        let ld = parse_log_directory_checked("/tmp/q:100k:3").unwrap();
+        assert_eq!(ld.dir, "/tmp/q");
+        assert_eq!(ld.maxsize, 100_000);
+        assert_eq!(ld.numfile, 3);
+
+        let ld = parse_log_directory_checked("/tmp/q:2m:10").unwrap();
+        assert_eq!(ld.maxsize, 2_000_000);
+        assert_eq!(ld.numfile, 10);
+
+        let ld = parse_log_directory_checked("/tmp/q:1g:1").unwrap();
+        assert_eq!(ld.maxsize, 1_000_000_000);
+        assert_eq!(ld.numfile, 1);
+
+        // Bare number = bytes; uppercase suffix also accepted.
+        let ld = parse_log_directory_checked("/tmp/q:2048:4").unwrap();
+        assert_eq!(ld.maxsize, 2048);
+        let ld = parse_log_directory_checked("/tmp/q:5M:4").unwrap();
+        assert_eq!(ld.maxsize, 5_000_000);
+
+        // Whitespace around segments is tolerated.
+        let ld = parse_log_directory_checked(" /tmp/q : 5m : 5 ").unwrap();
+        assert_eq!(ld.dir, "/tmp/q");
+        assert_eq!(ld.maxsize, 5_000_000);
+        assert_eq!(ld.numfile, 5);
+    }
+
+    #[test]
+    fn test_parse_log_directory_invalid_returns_none() {
+        let cases = [
+            "",                     // empty
+            "/var/log/rsdns:5m",    // missing numfile
+            "/var/log/rsdns::5",    // empty maxsize
+            ":5m:5",                // empty dir
+            "/var/log/rsdns:5m:0",  // numfile = 0
+            "/var/log/rsdns:0:5",   // maxsize = 0
+            "/var/log/rsdns:abc:5", // bad size
+            "/var/log/rsdns:5m:xx", // bad numfile
+        ];
+        for case in cases {
+            assert_eq!(parse_log_directory_checked(case), None, "case: {case:?}");
+        }
     }
 }

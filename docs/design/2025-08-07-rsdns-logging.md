@@ -76,6 +76,7 @@ pub struct Config {
 | `{duration}` | 查询耗时，秒，保留 5 位小数 | `Instant::elapsed()` | `0.01234` |
 | `{rcode}` | 应答状态码 | `response.metadata.response_code` | `NOERROR` |
 | `{action}` | 查询动作标签 | `do_query()` 返回值 | `hosts` / `forward(default)` |
+| `{time}` | 请求发起时刻（wall-clock，本地时区，`DD/MM/YYYY:HH:MM:SS ±HHMM`） | `QueryContext::start_time` | `27/08/2026:11:40:30 +0800` |
 
 未识别占位符会按原样保留，例如 `{foo}` 仍输出 `{foo}`。
 
