@@ -16,10 +16,14 @@ use crate::plugins::cache::{CacheEntry, CacheKey, CacheRecord, DnsCache};
 
 /// Constructs a DNS query `Message` for `name`/`qtype` (used for upstream
 /// resolution of cname targets and background refresh).
+///
+/// Parses `name` with `parse_name` (strict IDNA first, `from_ascii` fallback),
+/// so targets that render non-safe characters (e.g. an underscore in the middle
+/// of a label) still produce a valid query instead of failing.
 pub(crate) fn make_query_msg(name: &str, qtype: RecordType) -> io::Result<Message> {
     let mut msg = Message::new(0, MessageType::Query, OpCode::Query);
     let mut q = Query::new();
-    q.set_name(Name::from_utf8(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?);
+    q.set_name(parse_name(name)?);
     q.set_query_type(qtype);
     q.set_query_class(hickory_proto::rr::DNSClass::IN);
     msg.queries.push(q);
@@ -28,8 +32,18 @@ pub(crate) fn make_query_msg(name: &str, qtype: RecordType) -> io::Result<Messag
 }
 
 /// Parses a domain string into a hickory `Name`.
+///
+/// Tries strict IDNA (`from_utf8`) first, then falls back to `from_ascii` which
+/// accepts labels that `from_utf8` rejects (e.g. an underscore in the middle of
+/// a label, like `path3_new.example.com`). The fallback mirrors
+/// `Name::from_str_relaxed` semantics without its IDNA second pass; wire names
+/// rendered via `Display`/`to_utf8` (which escape non-safe characters) always
+/// re-parse cleanly, so the fallback only accepts names that were already safe
+/// on the wire.
 pub(crate) fn parse_name(name: &str) -> io::Result<Name> {
-    Name::from_utf8(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    Name::from_utf8(name)
+        .or_else(|_| Name::from_ascii(name))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 /// Basic response skeleton mirroring the query's id and question.
@@ -338,5 +352,20 @@ mod tests {
                 panic!("expected Fresh NoData entry for {qtype}");
             }
         }
+    }
+
+    #[test]
+    fn test_parse_name_accepts_underscore_label() {
+        // CNAME target 中间 label 含下划线（如 `path3_new.qcomgeo2.com`）时，
+        // `Name::from_utf8`（IDNA/STD3）会拒绝；`parse_name` 需回退到
+        // `from_ascii` 成功解析，否则 resolve_cname 无法处理此类 target。
+        let n = parse_name("path3_new.qcomgeo2.com.").expect("underscore label must parse");
+        assert_eq!(n.to_string(), "path3_new.qcomgeo2.com.");
+
+        // 常规域名仍走严格 IDNA 路径，行为不变（非 FQDN 输入不加尾点）。
+        assert_eq!(parse_name("www.example.com").unwrap().to_string(), "www.example.com");
+        // 非法字符（空格/控制符）仍被拒绝。
+        assert!(parse_name("bad name.com").is_err());
+        assert!(parse_name("bad\nname.com").is_err());
     }
 }
