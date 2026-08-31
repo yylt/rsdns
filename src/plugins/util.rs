@@ -8,6 +8,7 @@ use hickory_proto::op::{Message, MessageType, Metadata, OpCode, Query, ResponseC
 use hickory_proto::rr::rdata::{A, AAAA, CNAME, HTTPS, MX, TXT};
 use hickory_proto::rr::RData;
 use hickory_proto::rr::{Name, Record, RecordType};
+use notify::event::{AccessKind, AccessMode, ModifyKind};
 use notify::EventKind;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -245,11 +246,28 @@ pub(crate) fn build_nodata(msg: &Message) -> io::Result<Message> {
     make_response_base(msg)
 }
 
-/// Watch events that can change file content (incl. atomic tmp→target renames).
+/// Watch events that mean "file content finished changing" — the signal to
+/// reload.  Only the *completion* of a write counts:
+///
+/// - `Access(Close(Write))`: an in-place writer (e.g. `curl -o`, shell `>`)
+///   truncated + wrote the file in chunks, then closed it — the content is
+///   complete only at close.  Reacting to the intermediate `Modify(Data(_))`
+///   events would reload partial content multiple times per update.
+/// - `Modify(Name(_))`: an atomic rename (`mv tmp → target`) replaced the
+///   file — the new content is complete when the rename lands.
+///
+/// `Create`/`Remove` are also accepted so a brand-new file is picked up.
+/// Everything else (`Modify(Data(_))` per chunk, metadata, opens, reads,
+/// close-without-write) is ignored.
 pub(crate) fn is_change_event(kind: &EventKind) -> bool {
     matches!(
         kind,
-        EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(_) | EventKind::Any | EventKind::Other
+        EventKind::Access(AccessKind::Close(AccessMode::Write))
+            | EventKind::Modify(ModifyKind::Name(_))
+            | EventKind::Create(_)
+            | EventKind::Remove(_)
+            | EventKind::Any
+            | EventKind::Other
     )
 }
 
@@ -257,6 +275,9 @@ pub(crate) fn is_change_event(kind: &EventKind) -> bool {
 mod tests {
     use super::*;
     use crate::plugins::cache::{CacheResult, DnsCache};
+    use notify::event::{
+        AccessKind, AccessMode, CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind, RenameMode,
+    };
 
     /// 构造一个设置了 RD/CD 与自定义 opcode 的查询消息。
     fn query_msg_with_flags() -> Message {
@@ -367,5 +388,25 @@ mod tests {
         // 非法字符（空格/控制符）仍被拒绝。
         assert!(parse_name("bad name.com").is_err());
         assert!(parse_name("bad\nname.com").is_err());
+    }
+
+    #[test]
+    fn test_is_change_event_write_completion_only() {
+        // 原地覆写过程中间的每次数据写入（truncate / 分块写）不应触发重载，
+        // 只有关闭写入句柄（Close(Write)）才表示内容写完。
+        assert!(!is_change_event(&EventKind::Modify(ModifyKind::Data(DataChange::Any))));
+        assert!(is_change_event(&EventKind::Access(AccessKind::Close(AccessMode::Write))));
+
+        // 原子 rename 替换（mv tmp → target）是完整内容的落地信号。
+        assert!(is_change_event(&EventKind::Modify(ModifyKind::Name(RenameMode::From))));
+        assert!(is_change_event(&EventKind::Modify(ModifyKind::Name(RenameMode::To))));
+        assert!(is_change_event(&EventKind::Modify(ModifyKind::Name(RenameMode::Both))));
+
+        // 新建/删除文件仍触发；只读关闭、元数据、打开不触发。
+        assert!(is_change_event(&EventKind::Create(CreateKind::File)));
+        assert!(is_change_event(&EventKind::Remove(RemoveKind::File)));
+        assert!(!is_change_event(&EventKind::Access(AccessKind::Close(AccessMode::Read))));
+        assert!(!is_change_event(&EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any))));
+        assert!(!is_change_event(&EventKind::Access(AccessKind::Open(AccessMode::Any))));
     }
 }
