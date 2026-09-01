@@ -188,8 +188,10 @@ rules:
 #              {time} — query start time (wall-clock, local tz, DD/MM/YYYY:HH:MM:SS ±HHMM)
 # Output: stdout by default; set directory to write rotating files instead.
 #   directory: "{dir}:{maxsize}:{numfile}" — write to dir/query.log; when the
-#   active file reaches maxsize it is gzip-archived as query.log.N.gz and a
-#   fresh file starts; at most numfile files (active + archives) are kept.
+#   active file reaches maxsize it is gzip-archived as query.log.N.gz with N
+#   increasing monotonically (existing archives are never renamed) and a
+#   fresh file starts; at most numfile files (active + archives) are kept,
+#   the oldest (lowest-N) archives are pruned.
 #   maxsize supports k/K/m/M/g/G suffixes (5m = 5 MB).  A bare directory path
 #   (e.g. "/var/log/rsdns") uses the default maxsize/numfile (5m / 5 files).
 log:
