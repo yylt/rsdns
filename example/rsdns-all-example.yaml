@@ -6,10 +6,26 @@
 # (hosts / cache / rules / log / metrics).  Each plugin owns its own config
 # section and initializes from it.
 
-# Listen addresses: plain IP:port = UDP, tcp:// prefix = TCP
+# Listen addresses: plain IP:port = UDP, tcp:// prefix = TCP.
+# Encrypted listeners (TLS cert/key below, auto self-signed when omitted):
+#   tls://   → DoT (DNS-over-TLS, RFC 7858)
+#   https:// → DoH (DNS-over-HTTPS, RFC 8484; HTTP/1.1 + HTTP/2, path /dns-query)
+#   h3://    → DoH3 (DNS-over-HTTP/3; UDP socket, path /dns-query)
 binds:
   - address: "0.0.0.0:14453"          # UDP
   - address: "tcp://0.0.0.0:14453"    # TCP
+  # - address: "tls://0.0.0.0:8853"    # DoT
+  # - address: "https://0.0.0.0:8443"  # DoH (HTTP/1.1 + HTTP/2)
+  # - address: "h3://0.0.0.0:8443"     # DoH3 (HTTP/3)
+
+# Server TLS certificate/key for the tls:// / https:// / h3:// binds.
+# PEM files: cert may contain the leaf + intermediate chain; key is
+# PKCS#8 / RSA / EC.  Both must be set together.  When both are omitted and
+# at least one encrypted bind exists, an in-memory ECDSA P-256 self-signed
+# certificate (SAN: localhost + loopback/private IPs) is generated at
+# startup — enough for testing, not for production.
+# tls_cert: /etc/rsdns/server.crt
+# tls_key: /etc/rsdns/server.key
 
 # Domain groups: name + optional domains list (inline or file:// sources).
 # file:// sources are watched and reloaded automatically on change.
@@ -100,6 +116,8 @@ hosts:
 #   (empty)         → match all
 #   group:{name}    → group reference
 #   {a.com,b.com}   → inline domain set (no braces, comma separated)
+#   "{1}.a.com,{1}.b.com" → comma-separated placeholder templates (any one
+#                           matching applies the rule; captures shared)
 rules:
   # Block ad group with poison (A=0.0.0.0, AAAA=::)
   - match: "group:ad"

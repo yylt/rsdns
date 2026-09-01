@@ -20,6 +20,15 @@ pub struct Config {
     /// Listen addresses: `"0.0.0.0:53"` for UDP, `"tcp://0.0.0.0:53"` for TCP.
     #[serde(default)]
     pub binds: Vec<BindConfig>,
+    /// Server TLS certificate PEM file path, shared by all `tls://` (DoT),
+    /// `https://` (DoH) and `h3://` (DoH3) binds.  May contain the leaf
+    /// certificate followed by intermediate chain certificates.
+    #[serde(default)]
+    pub tls_cert: Option<String>,
+    /// Server TLS private key PEM file path (PKCS#8 / RSA / EC), paired with
+    /// `tls_cert`.
+    #[serde(default)]
+    pub tls_key: Option<String>,
     /// Domain groups (array, config order = match priority).
     #[serde(default)]
     pub groups: Vec<GroupConfig>,
@@ -173,7 +182,9 @@ pub struct RuleConfig {
     /// Match target: empty/missing/`*` = match all, `group:{name}`,
     /// `{a.com,b.com}` (inline set), or a `{N}.{domain}` placeholder
     /// template (e.g. `{1}.example.com`; `{N}` captures a query label and
-    /// can be reused in actions like `cname.target`).
+    /// can be reused in actions like `cname.target`).  Multiple templates
+    /// may be comma-separated (`"{1}.a.com,{1}.b.com"`); any one matching
+    /// applies the rule.
     /// Parsed at build time into a `MatchTarget`; invalid syntax is a config error.
     #[serde(default, alias = "r#match")]
     pub r#match: Option<String>,
@@ -518,6 +529,27 @@ some_future_plugin:
         assert_eq!(config.binds.len(), 1);
         assert_eq!(config.plugin_sections.len(), 1);
         assert!(config.plugin_sections.contains_key("some_future_plugin"));
+    }
+
+    #[test]
+    fn test_tls_cert_key_parse() {
+        // tls_cert / tls_key are typed top-level fields, not plugin sections.
+        let yaml = r#"
+binds:
+  - address: "tls://0.0.0.0:853"
+tls_cert: /etc/rsdns/server.crt
+tls_key: /etc/rsdns/server.key
+"#;
+        let config = Config::from_yaml_str(yaml).expect("parse failed");
+        assert_eq!(config.tls_cert.as_deref(), Some("/etc/rsdns/server.crt"));
+        assert_eq!(config.tls_key.as_deref(), Some("/etc/rsdns/server.key"));
+        assert!(!config.plugin_sections.contains_key("tls_cert"));
+        assert!(!config.plugin_sections.contains_key("tls_key"));
+
+        // Both absent → None; unknown keys still land in plugin_sections.
+        let config = Config::from_yaml_str("binds: [{ address: \"0.0.0.0:53\" }]\n").expect("parse failed");
+        assert!(config.tls_cert.is_none());
+        assert!(config.tls_key.is_none());
     }
 
     #[test]

@@ -44,7 +44,9 @@ pub struct QueryContext {
     pub key: CacheKey,
     /// Client address.
     pub client: SocketAddr,
-    /// "udp" or "tcp".
+    /// Wire protocol: "udp", "tcp", "tls" (DoT), "doh" (DoH) or "doh3"
+    /// (DoH3).  Rendered as `{proto}` in query logs and as the
+    /// `rsdns_logs_queries_total{proto=...}` metric label.
     pub proto: &'static str,
     /// When the query was received (monotonic, for `{duration}`).
     pub start: Instant,

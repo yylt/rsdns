@@ -27,10 +27,12 @@
 //! (match-all), `group:{name}`, an inline domain set (`a.com,b.com`; a
 //! single bare domain is a one-element set), and the `{1}.{domain}`
 //! placeholder template — a literal suffix preceded by `{N}` placeholders.
-//! Each `{N}` captures the query label directly before the suffix (e.g.
-//! `match: "{1}.example.com"` captures `foo` from `foo.example.com`); the
-//! capture is stored in `ctx.captures` and can be substituted into the
-//! rule action (e.g. `cname.target: "{1}.cdn.example.com"`).
+//! Multiple templates may be comma-separated (`"{1}.a.com,{1}.b.com"`),
+//! any one matching applies the rule. Each `{N}` captures the query label
+//! directly before the suffix (e.g. `match: "{1}.example.com"` captures
+//! `foo` from `foo.example.com`); the capture is stored in `ctx.captures`
+//! and can be substituted into the rule action (e.g.
+//! `cname.target: "{1}.cdn.example.com"`).
 
 use std::io;
 use std::str::FromStr;
@@ -62,9 +64,11 @@ pub enum MatchTarget {
     MatchAll,
     Group(String),
     InlineDomains(Vec<String>),
-    /// `{N}.{domain}` placeholder template: literal suffix with `{N}`
-    /// placeholders before it, each capturing one query label.
-    Template(TemplatePattern),
+    /// `{N}.{domain}` placeholder templates: one or more comma-separated
+    /// patterns (`"{1}.a.com,{1}.b.com"`), each a literal suffix with `{N}`
+    /// placeholders before it capturing one query label.  Any pattern
+    /// matching the query applies the rule.
+    Template(Vec<TemplatePattern>),
 }
 
 /// Parsed placeholder template, e.g. `{1}.example.com` →
@@ -84,7 +88,8 @@ pub struct TemplatePattern {
 /// - 空 / 缺省 / `*` → `MatchAll`
 /// - `group:{name}` → `Group`
 /// - 逗号分隔的内联域名集合（无大括号）→ `InlineDomains`
-/// - `{N}.{domain}` 占位符模板（`{N}` 之后必须有字面域名后缀）→ `Template`
+/// - `{N}.{domain}` 占位符模板（`{N}` 之后必须有字面域名后缀），可用逗号
+///   分隔多个模板（任一命中即应用规则）→ `Template`
 pub fn parse_match_target(s: &str) -> Result<MatchTarget, String> {
     let s = s.trim();
     if s.is_empty() || s == "*" {
@@ -97,21 +102,26 @@ pub fn parse_match_target(s: &str) -> Result<MatchTarget, String> {
         }
         return Ok(MatchTarget::Group(name.to_string()));
     }
-    // {N} 占位符模板
+    // {N} 占位符模板：逗号分隔的多个模板（任一命中即应用规则）；每段都须是
+    // 合法模板，否则配置错误。
     if s.contains('{') || s.contains('}') {
-        return parse_template(s);
+        let mut patterns = Vec::new();
+        for part in s.split(',') {
+            patterns.push(parse_template(part.trim())?);
+        }
+        return Ok(MatchTarget::Template(patterns));
     }
     // 逗号分隔的内联域名集合；单域名 = 单元素内联列表
     let domains = parse_inline_domains(s)?;
     Ok(MatchTarget::InlineDomains(domains))
 }
 
-/// 解析 `{N}.{domain}` 占位符模板。
+/// 解析单个 `{N}.{domain}` 占位符模板。
 ///
 /// 语法：开头是若干 `{N}`（N ≥ 1）占位符（点分隔），之后必须紧跟 `.`
 /// 加字面域名后缀（如 `.foo`、`.foo.bar`）；占位符只允许出现在后缀之前。
 /// 占位符之间必须以 `.` 分隔；字面后缀沿用域名校验。
-fn parse_template(s: &str) -> Result<MatchTarget, String> {
+fn parse_template(s: &str) -> Result<TemplatePattern, String> {
     let segments: Vec<&str> = s.split('.').collect();
     let mut placeholders = Vec::new();
     let mut idx = 0;
@@ -146,7 +156,7 @@ fn parse_template(s: &str) -> Result<MatchTarget, String> {
         ));
     }
     let suffix = validate_domain(&suffix).ok_or_else(|| format!("invalid match target {s:?}: bad domain suffix"))?;
-    Ok(MatchTarget::Template(TemplatePattern { suffix, placeholders }))
+    Ok(TemplatePattern { suffix, placeholders })
 }
 
 /// 校验并规范化一个域名（拒绝尾随点）；标签 `[a-z0-9-_]`，不允许前导/尾随
@@ -245,10 +255,16 @@ impl Rule {
             MatchTarget::MatchAll => true,
             MatchTarget::Group(name) => ctx.group.as_deref() == Some(name.as_str()),
             MatchTarget::InlineDomains(domains) => suffix_match_any(domains, domain),
-            MatchTarget::Template(t) => template_match(t, domain).is_some_and(|caps| {
-                ctx.captures = caps;
-                true
-            }),
+            MatchTarget::Template(patterns) => {
+                // 任一模板命中即应用规则；首个命中把捕获写入 ctx.captures。
+                for t in patterns {
+                    if let Some(caps) = template_match(t, domain) {
+                        ctx.captures = caps;
+                        return true;
+                    }
+                }
+                false
+            }
         }
     }
 }
@@ -916,32 +932,115 @@ mod tests {
         };
         assert_eq!(
             tpl("{1}.example.com"),
-            TemplatePattern {
+            vec![TemplatePattern {
                 suffix: "example.com".into(),
                 placeholders: vec![1],
-            }
+            }]
         );
         assert_eq!(
             tpl("{2}.example.com"),
-            TemplatePattern {
+            vec![TemplatePattern {
                 suffix: "example.com".into(),
                 placeholders: vec![2],
-            }
+            }]
         );
         assert_eq!(
             tpl("{1}.foo.bar"),
-            TemplatePattern {
+            vec![TemplatePattern {
                 suffix: "foo.bar".into(),
                 placeholders: vec![1],
-            }
+            }]
         );
         assert_eq!(
             tpl("{1}.{2}.foo.bar"),
-            TemplatePattern {
+            vec![TemplatePattern {
                 suffix: "foo.bar".into(),
                 placeholders: vec![1, 2],
-            }
+            }]
         );
+    }
+
+    #[test]
+    fn test_parse_template_list() {
+        // 逗号分隔的多个模板：任一命中即应用规则。
+        assert_eq!(
+            parse_ok("{1}.a.com,{1}.b.com"),
+            MatchTarget::Template(vec![
+                TemplatePattern {
+                    suffix: "a.com".into(),
+                    placeholders: vec![1],
+                },
+                TemplatePattern {
+                    suffix: "b.com".into(),
+                    placeholders: vec![1],
+                },
+            ])
+        );
+        // 逗号 + 空格容忍；每段独立解析（不同占位符数 / 后缀深度）。
+        assert_eq!(
+            parse_ok("{1}.a.com, {2}.b.example.com"),
+            MatchTarget::Template(vec![
+                TemplatePattern {
+                    suffix: "a.com".into(),
+                    placeholders: vec![1],
+                },
+                TemplatePattern {
+                    suffix: "b.example.com".into(),
+                    placeholders: vec![2],
+                },
+            ])
+        );
+        // 含逗号但无占位符 → 仍是内联域名集合（回落路径，行为不变）。
+        assert_eq!(
+            parse_ok("a.com,b.com"),
+            MatchTarget::InlineDomains(vec!["a.com".into(), "b.com".into()])
+        );
+    }
+
+    #[test]
+    fn test_rule_matches_template_list() {
+        use crate::plugins::cache::CacheKey;
+        use std::net::SocketAddr;
+        use std::time::Instant;
+
+        let rule = Rule {
+            target: parse_ok("{1}.a.com,{1}.b.com"),
+            qtype: None,
+            action: RuleAction::Rewrite {
+                target: "{1}.32.0.2".into(),
+                ttl: 300,
+            },
+        };
+        let ctx = |name: &str| {
+            let msg = make_query_msg(name, RecordType::A).unwrap();
+            QueryContext::new(
+                msg,
+                CacheKey::new(name, RecordType::A),
+                SocketAddr::from_str("127.0.0.1:5353").unwrap(),
+                "udp",
+                Instant::now(),
+                0,
+            )
+        };
+
+        // 命中第一个模板
+        let mut c = ctx("node1.a.com");
+        assert!(rule.matches(&mut c));
+        assert_eq!(c.captures, vec!["node1".to_string()]);
+
+        // 命中第二个模板
+        let mut c = ctx("node2.b.com");
+        assert!(rule.matches(&mut c));
+        assert_eq!(c.captures, vec!["node2".to_string()]);
+
+        // {1} 捕获后缀前紧邻 label，与单模板语义一致
+        let mut c = ctx("x.node3.a.com");
+        assert!(rule.matches(&mut c));
+        assert_eq!(c.captures, vec!["node3".to_string()]);
+
+        // 两个后缀都不命中
+        let mut c = ctx("node1.c.com");
+        assert!(!rule.matches(&mut c));
     }
 
     #[test]
@@ -970,6 +1069,11 @@ mod tests {
             "{1}..example.com",
             "{1}.example..com",
             "{1}.-bad.com",
+            // 逗号分隔的模板：任一段非法 → 整体配置错误
+            "{1}.a.com,",
+            ",{1}.a.com",
+            "{1}.a.com,{1}",
+            "cdn.{1}.a.com,{1}.b.com",
         ] {
             assert!(parse_match_target(bad).is_err(), "should reject: {bad:?}");
         }

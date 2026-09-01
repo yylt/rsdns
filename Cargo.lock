@@ -1469,6 +1469,7 @@ dependencies = [
  "aws-lc-rs",
  "bytes",
  "clap",
+ "data-encoding",
  "flate2",
  "fst",
  "futures",
@@ -1499,6 +1500,7 @@ dependencies = [
  "tikv-jemallocator",
  "time",
  "tokio",
+ "tokio-rustls",
  "url",
  "x509-parser",
 ]

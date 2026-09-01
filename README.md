@@ -9,6 +9,10 @@
 - **监听（入站）**
   - UDP（`ip:port`）
   - TCP（`tcp://ip:port`）
+  - DoT（`tls://ip:port`，DNS-over-TLS）
+  - DoH（`https://ip:port`，DNS-over-HTTPS，HTTP/1.1 + HTTP/2）
+  - DoH3（`h3://ip:port`，DNS-over-HTTP/3）
+  - 加密监听共用顶层 `tls_cert` / `tls_key`（PEM），缺省时自动生成自签证书
 - **上游（出站）**
   - UDP / TCP（原生 DNS）
   - DoT（`tls://`）
@@ -49,6 +53,13 @@ cargo run --bin rsdns -- -c rsdns.yaml
 binds:
   - address: "0.0.0.0:53"
   - address: "tcp://0.0.0.0:53"
+  # - address: "tls://0.0.0.0:853"      # DoT（自动自签证书）
+  # - address: "https://0.0.0.0:8443"   # DoH（HTTP/1.1 + HTTP/2）
+  # - address: "h3://0.0.0.0:8443"      # DoH3（HTTP/3）
+
+# 加密监听的证书/私钥（PEM）；两者都省略时自动生成自签证书
+# tls_cert: /etc/rsdns/server.crt
+# tls_key: /etc/rsdns/server.key
 
 upstreams:
   - name: default
