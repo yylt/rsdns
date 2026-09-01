@@ -8,6 +8,7 @@ use hickory_proto::op::{Message, MessageType, Metadata, OpCode, Query, ResponseC
 use hickory_proto::rr::rdata::{A, AAAA, CNAME, HTTPS, MX, TXT};
 use hickory_proto::rr::RData;
 use hickory_proto::rr::{Name, Record, RecordType};
+use notify::event::{AccessKind, AccessMode, ModifyKind};
 use notify::EventKind;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -16,10 +17,14 @@ use crate::plugins::cache::{CacheEntry, CacheKey, CacheRecord, DnsCache};
 
 /// Constructs a DNS query `Message` for `name`/`qtype` (used for upstream
 /// resolution of cname targets and background refresh).
+///
+/// Parses `name` with `parse_name` (strict IDNA first, `from_ascii` fallback),
+/// so targets that render non-safe characters (e.g. an underscore in the middle
+/// of a label) still produce a valid query instead of failing.
 pub(crate) fn make_query_msg(name: &str, qtype: RecordType) -> io::Result<Message> {
     let mut msg = Message::new(0, MessageType::Query, OpCode::Query);
     let mut q = Query::new();
-    q.set_name(Name::from_utf8(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?);
+    q.set_name(parse_name(name)?);
     q.set_query_type(qtype);
     q.set_query_class(hickory_proto::rr::DNSClass::IN);
     msg.queries.push(q);
@@ -28,8 +33,18 @@ pub(crate) fn make_query_msg(name: &str, qtype: RecordType) -> io::Result<Messag
 }
 
 /// Parses a domain string into a hickory `Name`.
+///
+/// Tries strict IDNA (`from_utf8`) first, then falls back to `from_ascii` which
+/// accepts labels that `from_utf8` rejects (e.g. an underscore in the middle of
+/// a label, like `path3_new.example.com`). The fallback mirrors
+/// `Name::from_str_relaxed` semantics without its IDNA second pass; wire names
+/// rendered via `Display`/`to_utf8` (which escape non-safe characters) always
+/// re-parse cleanly, so the fallback only accepts names that were already safe
+/// on the wire.
 pub(crate) fn parse_name(name: &str) -> io::Result<Name> {
-    Name::from_utf8(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    Name::from_utf8(name)
+        .or_else(|_| Name::from_ascii(name))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 /// Basic response skeleton mirroring the query's id and question.
@@ -231,11 +246,28 @@ pub(crate) fn build_nodata(msg: &Message) -> io::Result<Message> {
     make_response_base(msg)
 }
 
-/// Watch events that can change file content (incl. atomic tmp→target renames).
+/// Watch events that mean "file content finished changing" — the signal to
+/// reload.  Only the *completion* of a write counts:
+///
+/// - `Access(Close(Write))`: an in-place writer (e.g. `curl -o`, shell `>`)
+///   truncated + wrote the file in chunks, then closed it — the content is
+///   complete only at close.  Reacting to the intermediate `Modify(Data(_))`
+///   events would reload partial content multiple times per update.
+/// - `Modify(Name(_))`: an atomic rename (`mv tmp → target`) replaced the
+///   file — the new content is complete when the rename lands.
+///
+/// `Create`/`Remove` are also accepted so a brand-new file is picked up.
+/// Everything else (`Modify(Data(_))` per chunk, metadata, opens, reads,
+/// close-without-write) is ignored.
 pub(crate) fn is_change_event(kind: &EventKind) -> bool {
     matches!(
         kind,
-        EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(_) | EventKind::Any | EventKind::Other
+        EventKind::Access(AccessKind::Close(AccessMode::Write))
+            | EventKind::Modify(ModifyKind::Name(_))
+            | EventKind::Create(_)
+            | EventKind::Remove(_)
+            | EventKind::Any
+            | EventKind::Other
     )
 }
 
@@ -243,6 +275,9 @@ pub(crate) fn is_change_event(kind: &EventKind) -> bool {
 mod tests {
     use super::*;
     use crate::plugins::cache::{CacheResult, DnsCache};
+    use notify::event::{
+        AccessKind, AccessMode, CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind, RenameMode,
+    };
 
     /// 构造一个设置了 RD/CD 与自定义 opcode 的查询消息。
     fn query_msg_with_flags() -> Message {
@@ -338,5 +373,40 @@ mod tests {
                 panic!("expected Fresh NoData entry for {qtype}");
             }
         }
+    }
+
+    #[test]
+    fn test_parse_name_accepts_underscore_label() {
+        // CNAME target 中间 label 含下划线（如 `path3_new.qcomgeo2.com`）时，
+        // `Name::from_utf8`（IDNA/STD3）会拒绝；`parse_name` 需回退到
+        // `from_ascii` 成功解析，否则 resolve_cname 无法处理此类 target。
+        let n = parse_name("path3_new.qcomgeo2.com.").expect("underscore label must parse");
+        assert_eq!(n.to_string(), "path3_new.qcomgeo2.com.");
+
+        // 常规域名仍走严格 IDNA 路径，行为不变（非 FQDN 输入不加尾点）。
+        assert_eq!(parse_name("www.example.com").unwrap().to_string(), "www.example.com");
+        // 非法字符（空格/控制符）仍被拒绝。
+        assert!(parse_name("bad name.com").is_err());
+        assert!(parse_name("bad\nname.com").is_err());
+    }
+
+    #[test]
+    fn test_is_change_event_write_completion_only() {
+        // 原地覆写过程中间的每次数据写入（truncate / 分块写）不应触发重载，
+        // 只有关闭写入句柄（Close(Write)）才表示内容写完。
+        assert!(!is_change_event(&EventKind::Modify(ModifyKind::Data(DataChange::Any))));
+        assert!(is_change_event(&EventKind::Access(AccessKind::Close(AccessMode::Write))));
+
+        // 原子 rename 替换（mv tmp → target）是完整内容的落地信号。
+        assert!(is_change_event(&EventKind::Modify(ModifyKind::Name(RenameMode::From))));
+        assert!(is_change_event(&EventKind::Modify(ModifyKind::Name(RenameMode::To))));
+        assert!(is_change_event(&EventKind::Modify(ModifyKind::Name(RenameMode::Both))));
+
+        // 新建/删除文件仍触发；只读关闭、元数据、打开不触发。
+        assert!(is_change_event(&EventKind::Create(CreateKind::File)));
+        assert!(is_change_event(&EventKind::Remove(RemoveKind::File)));
+        assert!(!is_change_event(&EventKind::Access(AccessKind::Close(AccessMode::Read))));
+        assert!(!is_change_event(&EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any))));
+        assert!(!is_change_event(&EventKind::Access(AccessKind::Open(AccessMode::Any))));
     }
 }
