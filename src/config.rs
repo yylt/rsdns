@@ -3,7 +3,7 @@
 //! The top-level [`Config`] mirrors `rsdns.yaml`.  The structural sections
 //! (`binds`, `groups`, `upstreams`) are arrays read directly by the server /
 //! pipeline stages, while every other top-level key (`rules`, `cache`,
-//! `log`, `hosts`, `metrics`, …) is captured verbatim in
+//! `log`, `hosts`, `ui`, …) is captured verbatim in
 //! [`Config::plugin_sections`] and consumed by the corresponding stage.
 //!
 //! The `upstreams` section is deserialized into [`Config::upstreams`] using
@@ -441,8 +441,8 @@ hosts:
 rules:
   - match: ""
     action: { type: forward, upstream: default }
-metrics:
-  bind: "0.0.0.0:9153"
+ui:
+  bind: "127.0.0.1:8153"
 "#;
         let config = Config::from_yaml_str(yaml).expect("parse failed");
         assert_eq!(config.binds.len(), 2);
@@ -463,7 +463,7 @@ metrics:
         assert!(config.plugin_sections.contains_key("cache"));
         assert!(config.plugin_sections.contains_key("hosts"));
         assert!(config.plugin_sections.contains_key("rules"));
-        assert!(config.plugin_sections.contains_key("metrics"));
+        assert!(config.plugin_sections.contains_key("ui"));
     }
 
     #[test]

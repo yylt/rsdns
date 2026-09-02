@@ -14,6 +14,7 @@ aws-lc-rs = { version = "1.18", optional = true, default-features = false }
 libmimalloc-sys = { version = "0.1.49", default-features = false, features = ["extended"], optional = true }
 mimalloc = { version = "0.1.48", default-features = false, optional = true }
 tikv-jemallocator = { version = "0.7", default-features = false, optional = true }
+tikv-jemalloc-sys = { version = "0.7", default-features = false, features = ["stats", "background_threads"], optional = true }
 bytes = { version = "1.10.1", default-features = false, features = ["std"] }
 clap = { version = "4.6", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 data-encoding = { version = "2.11", default-features = false }
@@ -23,8 +24,8 @@ futures = { version = "0.3.32", default-features = false, features = ["std"] }
 hickory-net = { version = "0.26", default-features = false, features = ["tokio"] }
 hickory-proto = { version = "0.26", default-features = false }
 http-body-util = { version = "0.1", default-features = false }
-hyper = { version = "1.8", default-features = false, features = ["server", "http1"] }
-hyper-util = { version = "0.1", default-features = false, features = ["http1", "server-auto", "client-legacy", "tokio"] }
+hyper = { version = "1.8", default-features = false, features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", default-features = false, features = ["http1", "http2", "server-auto", "client-legacy", "tokio"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
 moka = { version = "0.12", default-features = false, features = ["future"] }
 notify = { version = "8.2.0", default-features = false, features = ["macos_kqueue"] }
@@ -51,7 +52,7 @@ x509-parser = { version = "0.18.1", default-features = false }
 [features]
 default = ["aws-lc-rs", "jemalloc"]
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
-jemalloc = ["dep:tikv-jemallocator"]
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-sys"]
 ring = [
   "rustls/ring",
   "rcgen/ring",

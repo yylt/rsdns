@@ -1,5 +1,7 @@
 mod common;
 mod config;
+#[cfg(feature = "jemalloc")]
+mod jemalloc_conf;
 mod metrics;
 mod notify;
 mod plugins;
@@ -150,7 +152,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // 4. 绑定全部监听器（UDP/TCP/DoT/DoH/DoH3 + 可选 metrics）。任一绑定
+    // 4. 绑定全部监听器（UDP/TCP/DoT/DoH/DoH3 + 可选 ui）。任一绑定
     //    失败 → 整体失败退出。
     let mut bound_udp = Vec::new();
     let mut bound_tcp = Vec::new();
@@ -173,8 +175,8 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         bound_doh3.push((server.bind_udp(addr).await?, addr));
     }
 
-    let metrics_listener = if let Some(cfg) = plugins::metrics::config(&config) {
-        Some((plugins::metrics::bind_listener(&cfg).await?, cfg))
+    let ui_listener = if let Some(cfg) = plugins::ui::config(&config) {
+        Some((plugins::ui::bind_listener(&cfg).await?, cfg))
     } else {
         None
     };
@@ -184,7 +186,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         warn!("systemd notify failed (non-fatal): {}", e);
     }
 
-    // 6. 并发启动 accept 循环：UDP/TCP/DoT/DoH/DoH3 监听 + metrics HTTP 端点。
+    // 6. 并发启动 accept 循环：UDP/TCP/DoT/DoH/DoH3 监听 + ui HTTP 端点。
     let mut tasks = tokio::task::JoinSet::new();
     for (sock, addr) in bound_tcp {
         let server = server.clone();
@@ -233,14 +235,18 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    if let Some((listener, cfg)) = metrics_listener {
+    if let Some((listener, cfg)) = ui_listener {
         let registry = metrics.clone();
         tasks.spawn(async move {
-            if let Err(e) = plugins::metrics::serve_metrics(listener, cfg, registry).await {
-                error!("metrics server failed: {}", e);
+            if let Err(e) = plugins::ui::serve_ui(listener, cfg, registry).await {
+                error!("ui server failed: {}", e);
             }
         });
     }
+
+    // 无 ui 监听端点时，jemalloc 指标仍周期刷新（供调试/本地观察）。
+    #[cfg(feature = "jemalloc")]
+    plugins::jemalloc::spawn_refresh(metrics.clone(), std::time::Duration::from_secs(10));
 
     // 6. 等待任意 listener 结束（通常不会）。
     if let Some(Err(e)) = tasks.join_next().await {

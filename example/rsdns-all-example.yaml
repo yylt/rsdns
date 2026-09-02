@@ -3,7 +3,7 @@
 # (repo root is the rsdns crate root)
 #
 # Top-level sections: binds[] / groups[] / upstreams[] + plugin sections
-# (hosts / cache / rules / log / metrics).  Each plugin owns its own config
+# (hosts / cache / rules / log / ui).  Each plugin owns its own config
 # section and initializes from it.
 
 # Listen addresses: plain IP:port = UDP, tcp:// prefix = TCP.
@@ -214,9 +214,13 @@ speed:
   family: ANY
   timeout: 1s
 
-# Prometheus metrics endpoint (optional).  Registered metrics:
+# Built-in web UI (optional).  Serves two paths on one listener:
+#   /         mobile-friendly HTML dashboard (memory / cache / query metrics,
+#             colored rounded cards; auto-refreshes every 3s)
+#   /metrics  Prometheus text format (for scrapers)
+# Registered metrics:
 #   rsdns_logs_*, rsdns_hosts_*, rsdns_groups_*, rsdns_cache_*,
-#   rsdns_rules_*, rsdns_upstream_*, rsdns_upstream_pool_*
-metrics:
-  bind: "0.0.0.0:9153"
-  path: /metrics
+#   rsdns_rules_*, rsdns_upstream_*, rsdns_upstream_pool_*,
+#   rsdns_jemalloc_* (under the jemalloc feature)
+ui:
+  bind: "127.0.0.1:8153"

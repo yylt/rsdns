@@ -16,8 +16,10 @@
 pub mod cache;
 pub mod groups;
 pub mod hosts;
+#[cfg(feature = "jemalloc")]
+pub mod jemalloc;
 pub mod logs;
-pub mod metrics;
 pub mod rules;
 pub mod speed;
+pub mod ui;
 pub mod util;

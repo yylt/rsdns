@@ -25,7 +25,7 @@
 - **连接池**：自适应地址轮换、故障冷却、地址族偏好
 - **文件源**：`groups` / `hosts` 支持 `file://` 源，`notify` 监听文件变化自动重载
 - **systemd notify**：监听器全部绑定后发送 `READY=1`（`Type=notify`）
-- **metrics**：可选 Prometheus `/metrics` HTTP 端点
+- **ui**：可选内置 Web 状态页 + Prometheus `/metrics`（`ui:` 配置段；`/` 为手机友好的 HTML 仪表盘，`/metrics` 为 Prometheus 文本）
 
 ## 构建
 

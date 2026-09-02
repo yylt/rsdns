@@ -21,7 +21,7 @@ A rule-driven standalone DNS server implemented in Rust, with composable listene
 - **Connection pool**: adaptive address rotation, cooldown on failure, address-family preference
 - **File sources**: `groups` / `hosts` support `file://` sources, auto-reloaded on change via `notify`
 - **systemd notify**: sends `READY=1` once all listeners are bound (`Type=notify`)
-- **metrics**: optional Prometheus `/metrics` HTTP endpoint
+- **ui**: optional built-in web status page + Prometheus `/metrics` (`ui:` config section; `/` is a mobile-friendly HTML dashboard, `/metrics` is the Prometheus text endpoint)
 
 ## Build
 

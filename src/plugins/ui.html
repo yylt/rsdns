@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rsdns 状态</title>
+<style>
+  :root {
+    --bg: #f4f6fb;
+    --card: #ffffff;
+    --text: #1f2937;
+    --muted: #6b7280;
+    --mem: #2563eb;
+    --cache: #059669;
+    --query: #d97706;
+    --group: #7c3aed;
+    --radius: 14px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 16px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                 "Helvetica Neue", Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 16px;
+  }
+  #status { font-size: 12px; color: var(--muted); }
+  #status.error { color: #dc2626; }
+  .modules { display: grid; grid-template-columns: 1fr; gap: 16px; }
+  @media (min-width: 720px) { .modules { grid-template-columns: 1fr 1fr; } }
+  .module {
+    background: var(--card);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    box-shadow: 0 1px 3px rgba(0,0,0,.08);
+  }
+  .module h2 {
+    font-size: 15px;
+    margin: 0 0 10px;
+    padding-left: 10px;
+    border-left: 4px solid var(--mod-color);
+    color: var(--text);
+  }
+  .cards { display: grid; grid-template-columns: 1fr; gap: 10px; }
+  @media (min-width: 720px) { .cards { grid-template-columns: 1fr 1fr; } }
+  .card {
+    background: #fafbfe;
+    border: 1px solid #e5e7eb;
+    border-radius: 12px;
+    padding: 10px 12px;
+    border-left: 4px solid var(--card-color);
+  }
+  .card .label { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .card .value {
+    font-size: 22px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.2;
+    word-break: break-word;
+  }
+  .card .value small { font-size: 13px; font-weight: 400; color: var(--muted); }
+  .card .desc { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  footer {
+    margin-top: 18px;
+    font-size: 12px;
+    color: var(--muted);
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+<header>
+  <span id="status">加载中…</span>
+</header>
+<div class="modules" id="modules"></div>
+<footer>
+  <span>/metrics</span> · 每 3 秒自动刷新
+</footer>
+<script>
+"use strict";
+
+// ---- 人类可读格式化 ----
+function fmtBytes(v) {
+  if (!isFinite(v)) return "0";
+  if (v < 1024) return v.toFixed(0) + " B";
+  const units = ["KB", "MB", "GB", "TB"];
+  let u = -1;
+  let n = v;
+  do { n /= 1024; u++; } while (n >= 1024 && u < units.length - 1);
+  return n.toFixed(n >= 100 ? 0 : 1) + " " + units[u];
+}
+function fmtInt(v) {
+  if (!isFinite(v)) return "0";
+  return Math.round(v).toLocaleString("en-US");
+}
+function fmtCount(v) {
+  if (!isFinite(v)) return "0";
+  if (v >= 1e9) return (v / 1e9).toFixed(2) + " G";
+  if (v >= 1e6) return (v / 1e6).toFixed(2) + " M";
+  if (v >= 1e3) return (v / 1e3).toFixed(1) + " k";
+  return Math.round(v).toLocaleString("en-US");
+}
+
+// ---- 模块白名单（少而精）：内存 / 缓存 / 查询 / 组 ----
+// match: 要匹配的 label（缺省表示无 label 的 series）
+const MODULES = [
+  {
+    title: "内存",
+    color: "#2563eb",
+    items: [
+      { name: "rsdns_jemalloc_allocated_bytes", label: "已分配", fmt: fmtBytes, desc: "stats.allocated" },
+      { name: "rsdns_jemalloc_active_bytes", label: "活跃页", fmt: fmtBytes, desc: "stats.active" },
+      { name: "rsdns_jemalloc_resident_bytes", label: "常驻内存", fmt: fmtBytes, desc: "stats.resident" },
+      { name: "rsdns_jemalloc_mapped_bytes", label: "映射空间", fmt: fmtBytes, desc: "stats.mapped" },
+    ],
+  },
+  {
+    title: "缓存",
+    color: "#059669",
+    items: [
+      { name: "rsdns_cache_entries", label: "缓存条目", fmt: fmtInt, desc: "当前缓存记录数" },
+      { name: "rsdns_cache_lookup_total", match: { result: "fresh" }, label: "命中", fmt: fmtCount, desc: "缓存命中次数" },
+      { name: "rsdns_cache_lookup_total", match: { result: "miss" }, label: "未命中", fmt: fmtCount, desc: "缓存未命中次数" },
+    ],
+  },
+  {
+    title: "查询",
+    color: "#d97706",
+    items: [
+      { name: "rsdns_logs_queries_total", label: "查询总数", fmt: fmtCount, desc: "所有协议的查询" },
+      { name: "rsdns_rules_matched_total", label: "规则命中", fmt: fmtCount, desc: "各动作命中次数", perLabel: "action" },
+    ],
+  },
+  {
+    title: "域名组",
+    color: "#7c3aed",
+    items: [
+      { name: "rsdns_hosts_entries", label: "hosts 条目", fmt: fmtInt, desc: "已加载的 hosts 条目数" },
+      { name: "rsdns_hosts_hit_total", label: "hosts 匹配", fmt: fmtCount, desc: "hosts 命中次数" },
+      { name: "rsdns_groups_entries", label: "组条目", fmt: fmtInt, desc: "各组域名条目数", perGroup: true },
+      { name: "rsdns_groups_hit_total", label: "组命中", fmt: fmtCount, desc: "各组命中次数", perGroup: true },
+    ],
+  },
+];
+
+// ---- Prometheus 文本解析 ----
+// 只关心数据行: name{labels} value（# 注释行忽略）
+function parseMetrics(text) {
+  const series = [];
+  for (const line of text.split("\n")) {
+    const t = line.trim();
+    if (!t || t.startsWith("#")) continue;
+    const m = t.match(/^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{([^}]*)\})?\s+([0-9.eE+-]+)$/);
+    if (!m) continue;
+    const labels = {};
+    if (m[2]) {
+      for (const pair of m[2].split(",")) {
+        const idx = pair.indexOf("=");
+        if (idx > 0) {
+          labels[pair.slice(0, idx).trim()] = pair.slice(idx + 1).replace(/^"|"$/g, "");
+        }
+      }
+    }
+    series.push({ name: m[1], labels, value: parseFloat(m[3]) });
+  }
+  return series;
+}
+
+function seriesMatch(s, item) {
+  if (s.name !== item.name) return false;
+  if (item.match) {
+    for (const k of Object.keys(item.match)) {
+      if (s.labels[k] !== item.match[k]) return false;
+    }
+  }
+  return true;
+}
+
+function fmtValue(item, s) {
+  if (!s) return "0";
+  return item.fmt(s.value);
+}
+
+function render(series) {
+  const root = document.getElementById("modules");
+  root.innerHTML = "";
+  for (const mod of MODULES) {
+    const sec = document.createElement("section");
+    sec.className = "module";
+    sec.style.setProperty("--mod-color", mod.color);
+    const h = document.createElement("h2");
+    h.textContent = mod.title;
+    sec.appendChild(h);
+    const cards = document.createElement("div");
+    cards.className = "cards";
+    for (const item of mod.items) {
+      let matched = series.filter((s) => seriesMatch(s, item));
+      // 无 label 的指标：聚合所有 series（如 total 类带不同 label 时求和展示）
+      if (!item.match && !item.perGroup && !item.perLabel && matched.length > 1) {
+        matched = [{ name: item.name, labels: {}, value: matched.reduce((a, s) => a + s.value, 0) }];
+      }
+      const card = document.createElement("div");
+      card.className = "card";
+      card.style.setProperty("--card-color", mod.color);
+      const lab = document.createElement("div");
+      lab.className = "label";
+      if (item.perGroup) lab.textContent = item.label + "（各组）";
+      else if (item.perLabel) lab.textContent = item.label + "（按 " + item.perLabel + "）";
+      else lab.textContent = item.label;
+      const val = document.createElement("div");
+      val.className = "value";
+      const labelKey = item.perGroup ? "group" : item.perLabel;
+      if (labelKey && matched.length > 0) {
+        val.innerHTML = matched
+          .map((s) => {
+            const g = s.labels[labelKey] || "?";
+            return escapeHtml(g) + " <small>" + item.fmt(s.value) + "</small>";
+          })
+          .join(" · ");
+      } else {
+        const s = matched[0];
+        val.textContent = fmtValue(item, s);
+      }
+      card.appendChild(lab);
+      card.appendChild(val);
+      if (item.desc) {
+        const d = document.createElement("div");
+        d.className = "desc";
+        d.textContent = item.desc;
+        card.appendChild(d);
+      }
+      cards.appendChild(card);
+    }
+    sec.appendChild(cards);
+    root.appendChild(sec);
+  }
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, (c) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+  ));
+}
+
+async function refresh() {
+  const status = document.getElementById("status");
+  try {
+    const resp = await fetch("/metrics", { cache: "no-store" });
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const text = await resp.text();
+    render(parseMetrics(text));
+    status.classList.remove("error");
+    status.textContent = "更新于 " + new Date().toLocaleTimeString();
+  } catch (e) {
+    status.classList.add("error");
+    status.textContent = "更新失败：" + e.message;
+  }
+}
+
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>
