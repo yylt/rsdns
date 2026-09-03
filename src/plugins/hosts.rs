@@ -234,7 +234,7 @@ pub fn init(config: &Config, registry: &MetricsRegistry) -> Hosts {
         let cb_metrics = metrics.clone();
         match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             let Ok(event) = res else { return };
-            if !is_change_event(&event.kind) || event.flag().is_some() {
+            if !is_change_event(&event.kind) {
                 return;
             }
             let new_trie = build_hosts_trie(&cb_entries);

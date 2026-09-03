@@ -219,7 +219,7 @@ pub fn init(config: &Config, registry: &MetricsRegistry) -> Groups {
             let cb_metrics = metrics.clone();
             match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
                 let Ok(event) = res else { return };
-                if !is_change_event(&event.kind) || event.flag().is_some() {
+                if !is_change_event(&event.kind) {
                     return;
                 }
                 reload_group(&cb_state, &cb_metrics);
