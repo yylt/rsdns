@@ -12,8 +12,11 @@
 //!   caps the number of answer records returned (default 5, `0` = no limit);
 //!   `resolve_cname: true` resolves the target when the response's first
 //!   answer is a CNAME (only the last CNAME of a pure CNAME chain is
-//!   resolved; A/AAAA replaces it with owner = queried name, empty drops
-//!   it and stops, CNAME keeps the original response); `edns: "cidr"` adds
+//!   resolved; a chain the response already completes with A/AAAA is
+//!   collapsed in place — CNAMEs dropped, A/AAAA owner = queried name;
+//!   otherwise an A/AAAA result replaces the chain with owner = queried
+//!   name, empty drops it and stops, CNAME keeps the original response);
+//!   `edns: "cidr"` adds
 //!   an EDNS Client Subnet (RFC 7871) option to every query this rule
 //!   sends (including `resolve_cname` follow-ups);
 //! - `rewrite` → **terminal**: synthesize an A record for the query name
@@ -723,8 +726,10 @@ impl Rules {
     /// `docs/design/2026-08-27-rsdns-forward-resolve-cname.md`）。
     ///
     /// 若开头连续多条都是 CNAME（纯 CNAME 链），**只处理最后一条**：直接解析
-    /// 最后一个 target，跳过多级中间链。解析返回 A/AAAA → 用其替换整条 CNAME
-    /// 链（owner 改写为原查询名.
+    /// 最后一个 target，跳过多级中间链。应答已自带完整链（链末 CNAME 的 target
+    /// 与末尾非 CNAME 的 A/AAAA owner 相同）时不发起二次查询，直接删除 CNAME
+    /// 链并改写 A/AAAA 的 owner（`chain_completed_with_address`）。
+    /// 其余情况：解析返回 A/AAAA → 用其替换整条 CNAME 链（owner 改写为原查询名）；
     /// 返回空 / 返回 CNAME / 其他类型 / 解析出错 → 原样保留当前响应并结束（不追链）。
     async fn resolve_cnames(
         &self,
@@ -739,6 +744,16 @@ impl Rules {
         let RData::CNAME(cname) = &resp.answers[idx].data else {
             return;
         };
+
+        // 快速路径：上游应答已自带完整链（链末 CNAME 的 target == 末尾非 CNAME
+        // 记录的 owner，且该记录是 A/AAAA），无需再发起二次查询——直接删除 CNAME
+        // 链并把 A/AAAA 的 owner 改写为原查询名。
+        if chain_completed_with_address(&resp.answers) {
+            let query_name = ctx.msg.queries.first().map(|q| q.name()).unwrap();
+            collapse_completed_chain(resp, query_name);
+            return;
+        }
+
         let target = cname.0.to_utf8();
         let mut target_msg = match make_query_msg(&target, ctx.qtype()) {
             Ok(msg) => msg,
@@ -863,6 +878,29 @@ fn last_cname_index(answers: &[Record]) -> Option<usize> {
     Some(idx - 1)
 }
 
+/// 上游应答是否**已自带完整链**：开头连续 CNAME 链最后一条的 target 与应答
+/// 最后一个非 CNAME 记录的 owner 相同（且该记录是 A/AAAA）。
+///
+/// 此时上游已递归到最终地址（如 `www CNAME cdn, cdn A 1.2.3.4`），无需再发起
+/// 二次查询；直接删除 CNAME 链并把 A/AAAA 的 owner 改写为原查询名即可。
+/// 最后一个非 CNAME 不是 A/AAAA（如 MX/TXT）、target 不相同、或纯 CNAME 链
+/// （无任何非 CNAME 记录）都返回 `false`，走原有 resolve 路径。
+fn chain_completed_with_address(answers: &[Record]) -> bool {
+    let Some(last_cname) = last_cname_index(answers) else {
+        return false;
+    };
+    let Some(last_data) = answers.iter().rposition(|r| r.record_type() != RecordType::CNAME) else {
+        return false;
+    };
+    if !matches!(answers[last_data].record_type(), RecordType::A | RecordType::AAAA) {
+        return false;
+    }
+    let RData::CNAME(cname) = &answers[last_cname].data else {
+        return false;
+    };
+    cname.0.eq_ignore_root(&answers[last_data].name)
+}
+
 /// 从解析结果中过滤出 A/AAAA 记录，并把 owner name 改写为 `owner`（原查询名）。
 fn address_records_with_owner(resolved: &Message, owner: &Name) -> Vec<Record> {
     resolved
@@ -875,6 +913,24 @@ fn address_records_with_owner(resolved: &Message, owner: &Name) -> Vec<Record> {
             rec
         })
         .collect()
+}
+
+/// 折叠上游**已自带完整链**的应答：删除开头连续 CNAME 链，把剩余 A/AAAA
+/// 记录的 owner 改写为 `owner`（原查询名）。调用方保证应答满足
+/// `chain_completed_with_address`（链末 CNAME 的 target 与末尾 A/AAAA 的
+/// owner 相同）；尾部其余非 A/AAAA 记录（实践中极少出现）保持原样不动。
+fn collapse_completed_chain(resp: &mut Message, owner: &Name) {
+    let keep_from = last_cname_index(&resp.answers).map_or(0, |i| i + 1);
+    let tail = resp.answers.split_off(keep_from);
+    resp.answers = tail
+        .into_iter()
+        .map(|mut rec| {
+            if matches!(rec.record_type(), RecordType::A | RecordType::AAAA) {
+                rec.name = owner.clone();
+            }
+            rec
+        })
+        .collect();
 }
 
 // ---------------------------------------------------------------------------
@@ -1302,5 +1358,89 @@ mod tests {
         assert_eq!(recs[0].name, owner);
         assert_eq!(recs[1].record_type(), RecordType::AAAA);
         assert_eq!(recs[1].name, owner);
+    }
+
+    #[test]
+    fn test_chain_completed_with_address() {
+        let cname = |name: &str, target: &str| {
+            Record::from_rdata(
+                Name::from_utf8(name).unwrap(),
+                300,
+                RData::CNAME(CNAME(Name::from_utf8(target).unwrap())),
+            )
+        };
+        let a = |name: &str, ip: u8| {
+            Record::from_rdata(Name::from_utf8(name).unwrap(), 300, RData::A(A(Ipv4Addr::new(10, 0, 0, ip))))
+        };
+        let mx = |name: &str| {
+            Record::from_rdata(
+                Name::from_utf8(name).unwrap(),
+                300,
+                RData::MX(hickory_proto::rr::rdata::MX::new(10, Name::from_utf8("mail").unwrap())),
+            )
+        };
+
+        // 链末 CNAME target == 末尾 A 的 owner → 完整链
+        assert!(chain_completed_with_address(&[
+            cname("a.com", "b.com"),
+            cname("b.com", "cdn.com"),
+            a("cdn.com", 1),
+            a("cdn.com", 2),
+        ]));
+        // 末尾非 CNAME 是 AAAA 也视为完整链
+        let mut aaaa_msg = make_query_msg("a.com", RecordType::AAAA).unwrap();
+        aaaa_msg.answers.push(Record::from_rdata(
+            Name::from_utf8("cdn.com").unwrap(),
+            300,
+            RData::AAAA(AAAA(Ipv6Addr::LOCALHOST)),
+        ));
+        assert!(chain_completed_with_address(&[
+            cname("a.com", "cdn.com"),
+            aaaa_msg.answers[0].clone(),
+        ]));
+
+        // 末尾非 CNAME 的 owner 与链末 target 不同 → 需二次 resolve
+        assert!(!chain_completed_with_address(&[cname("a.com", "cdn.com"), a("other.com", 1),]));
+        // 末尾非 CNAME 不是 A/AAAA（如 MX）→ 需二次 resolve
+        assert!(!chain_completed_with_address(&[cname("a.com", "cdn.com"), mx("cdn.com"),]));
+        // 纯 CNAME 链（无任何非 CNAME 记录）→ 需二次 resolve
+        assert!(!chain_completed_with_address(&[
+            cname("a.com", "b.com"),
+            cname("b.com", "c.com")
+        ]));
+        // 首条非 CNAME → 不处理
+        assert!(!chain_completed_with_address(&[a("a.com", 1)]));
+        // 空应答 → 不处理
+        assert!(!chain_completed_with_address(&[]));
+    }
+
+    #[test]
+    fn test_collapse_completed_chain() {
+        let cname = |name: &str, target: &str| {
+            Record::from_rdata(
+                Name::from_utf8(name).unwrap(),
+                300,
+                RData::CNAME(CNAME(Name::from_utf8(target).unwrap())),
+            )
+        };
+        let a = |name: &str, ip: u8| {
+            Record::from_rdata(Name::from_utf8(name).unwrap(), 300, RData::A(A(Ipv4Addr::new(10, 0, 0, ip))))
+        };
+
+        // 完整链：删除 CNAME 链，A/AAAA owner 改写为原查询名
+        let mut msg = make_query_msg("a.com", RecordType::A).unwrap();
+        msg.answers.extend([
+            cname("a.com", "b.com"),
+            cname("b.com", "cdn.com"),
+            a("cdn.com", 1),
+            a("cdn.com", 2),
+        ]);
+        let owner = Name::from_utf8("queried.com").unwrap();
+        collapse_completed_chain(&mut msg, &owner);
+        assert_eq!(msg.answers.len(), 2);
+        for rec in &msg.answers {
+            assert_eq!(rec.record_type(), RecordType::A);
+            assert_eq!(rec.name, owner);
+        }
     }
 }

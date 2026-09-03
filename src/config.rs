@@ -239,10 +239,13 @@ pub enum RuleActionConfig {
         #[serde(default)]
         deny_qtypes: Vec<String>,
         /// When the upstream response's first answer is a CNAME, actively
-        /// resolve its target (same upstream, same qtype).  An A/AAAA result
-        /// replaces the CNAME (owner rewritten to the queried name); an empty
-        /// result drops it and continues with the next answer; a CNAME result
-        /// keeps the original response untouched (no further chaining).
+        /// resolve its target (same upstream, same qtype).  A chain the
+        /// response already completes with A/AAAA is collapsed in place
+        /// (CNAMEs dropped, A/AAAA owner rewritten to the queried name, no
+        /// follow-up query); otherwise an A/AAAA result replaces the CNAME
+        /// (owner rewritten to the queried name); an empty result drops it
+        /// and continues with the next answer; a CNAME result keeps the
+        /// original response untouched (no further chaining).
         #[serde(default)]
         resolve_cname: bool,
         /// Fixed EDNS Client Subnet (RFC 7871) advertised to the upstream,
