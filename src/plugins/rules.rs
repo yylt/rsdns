@@ -12,10 +12,17 @@
 //!   caps the number of answer records returned (default 5, `0` = no limit);
 //!   `resolve_cname: true` resolves the target when the response's first
 //!   answer is a CNAME (only the last CNAME of a pure CNAME chain is
-//!   resolved; A/AAAA replaces it with owner = queried name, empty drops
-//!   it and stops, CNAME keeps the original response); `edns: "cidr"` adds
+//!   resolved; a chain the response already completes with A/AAAA is
+//!   collapsed in place — CNAMEs dropped, A/AAAA owner = queried name;
+//!   otherwise an A/AAAA result replaces the chain with owner = queried
+//!   name, empty drops it and stops, CNAME keeps the original response);
+//!   `edns: "cidr"` adds
 //!   an EDNS Client Subnet (RFC 7871) option to every query this rule
 //!   sends (including `resolve_cname` follow-ups);
+//!   `cloudflare_ech: "domain"` replaces HTTPS answers whose `ipv4hint` is
+//!   inside the built-in Cloudflare IPv4 ranges but carry no `ech`
+//!   SvcParam with an HTTPS template fetched from `domain` (same upstream,
+//!   cached by TTL);
 //! - `rewrite` → **terminal**: synthesize an A record for the query name
 //!   from the `target` (literal dotted-quad IPv4 or `{N}` placeholder
 //!   template filled from the match captures, e.g. `{1}.32.0.2`), `Respond`
@@ -27,31 +34,107 @@
 //! (match-all), `group:{name}`, an inline domain set (`a.com,b.com`; a
 //! single bare domain is a one-element set), and the `{1}.{domain}`
 //! placeholder template — a literal suffix preceded by `{N}` placeholders.
-//! Each `{N}` captures the query label directly before the suffix (e.g.
-//! `match: "{1}.example.com"` captures `foo` from `foo.example.com`); the
-//! capture is stored in `ctx.captures` and can be substituted into the
-//! rule action (e.g. `cname.target: "{1}.cdn.example.com"`).
+//! Multiple templates may be comma-separated (`"{1}.a.com,{1}.b.com"`),
+//! any one matching applies the rule. Each `{N}` captures the query label
+//! directly before the suffix (e.g. `match: "{1}.example.com"` captures
+//! `foo` from `foo.example.com`); the capture is stored in `ctx.captures`
+//! and can be substituted into the rule action (e.g.
+//! `cname.target: "{1}.cdn.example.com"`).
 
 use std::io;
+use std::net::Ipv4Addr;
 use std::str::FromStr;
+use std::sync::{Arc, OnceLock};
 
 use hickory_proto::op::Message;
 use hickory_proto::rr::rdata::opt::ClientSubnet;
-use hickory_proto::rr::rdata::{A, CNAME};
+use hickory_proto::rr::rdata::svcb::{IpHint, SvcParamKey, SvcParamValue};
+use hickory_proto::rr::rdata::{A, CNAME, HTTPS, SVCB};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use log::warn;
-use std::net::Ipv4Addr;
-use std::sync::Arc;
 
 use crate::common::domain_trie::{DomainSuffixTrie, DomainSuffixTrieBuilder};
 
 use crate::config::{BlockResponse as CfgBlockResponse, Config, RuleActionConfig, RuleConfig};
 use crate::metrics::{Counter, MetricsRegistry};
+use crate::plugins::cache::{CacheKey, CacheRecord, DnsCache};
 use crate::plugins::util::{
-    build_nodata, build_nxdomain, build_poison, build_servfail, make_query_msg, make_response_base, parse_name,
-    rewrite_ttl_in_response,
+    build_nodata, build_nxdomain, build_poison, build_servfail, cache_upstream_response, make_query_msg,
+    make_response_base, parse_name, rewrite_ttl_in_response,
 };
 use crate::query::{QueryContext, Step};
+
+// ---------------------------------------------------------------------------
+// Cloudflare IPv4 ranges (forward.cloudflare_ech)
+// ---------------------------------------------------------------------------
+
+/// Cloudflare IPv4 ranges from <https://www.cloudflare.com/ips-v4> (fetched
+/// 2026-09-03).  Used to decide whether an HTTPS record's `ipv4hint`
+/// belongs to Cloudflare — and is therefore a candidate for ECH
+/// completion.
+const CLOUDFLARE_IPV4_CIDRS: &[&str] = &[
+    "173.245.48.0/20",
+    "103.21.244.0/22",
+    "103.22.200.0/22",
+    "103.31.4.0/22",
+    "141.101.64.0/18",
+    "108.162.192.0/18",
+    "190.93.240.0/20",
+    "188.114.96.0/20",
+    "197.234.240.0/22",
+    "198.41.128.0/17",
+    "162.158.0.0/15",
+    "104.16.0.0/13",
+    "104.24.0.0/14",
+    "172.64.0.0/13",
+    "131.0.72.0/22",
+];
+
+/// A parsed IPv4 CIDR range (std-only integer comparison; no `ipnet` crate).
+struct Ipv4Cidr {
+    net: u32,
+    prefix: u8,
+}
+
+impl Ipv4Cidr {
+    fn parse(spec: &str) -> Self {
+        let (addr, prefix) = spec
+            .split_once('/')
+            .unwrap_or_else(|| panic!("invalid Cloudflare CIDR {spec:?}: missing prefix"));
+        let net = addr
+            .parse::<Ipv4Addr>()
+            .unwrap_or_else(|_| panic!("invalid Cloudflare CIDR {spec:?}: bad address"));
+        let prefix = prefix
+            .parse::<u8>()
+            .unwrap_or_else(|_| panic!("invalid Cloudflare CIDR {spec:?}: bad prefix"));
+        assert!(prefix <= 32, "invalid Cloudflare CIDR {spec:?}: prefix > 32");
+        Self {
+            net: u32::from(net),
+            prefix,
+        }
+    }
+
+    fn contains(&self, ip: Ipv4Addr) -> bool {
+        let ip = u32::from(ip);
+        let mask = if self.prefix == 0 {
+            0
+        } else {
+            u32::MAX << (32 - self.prefix)
+        };
+        (ip & mask) == (self.net & mask)
+    }
+}
+
+/// Parsed Cloudflare IPv4 ranges, initialized once.
+fn cloudflare_cidrs() -> &'static [Ipv4Cidr] {
+    static CIDRS: OnceLock<Vec<Ipv4Cidr>> = OnceLock::new();
+    CIDRS.get_or_init(|| CLOUDFLARE_IPV4_CIDRS.iter().map(|s| Ipv4Cidr::parse(s)).collect())
+}
+
+/// Whether `ip` falls inside any built-in Cloudflare IPv4 range.
+fn is_cloudflare_ip(ip: Ipv4Addr) -> bool {
+    cloudflare_cidrs().iter().any(|c| c.contains(ip))
+}
 
 // ---------------------------------------------------------------------------
 // Match target
@@ -62,9 +145,11 @@ pub enum MatchTarget {
     MatchAll,
     Group(String),
     InlineDomains(Vec<String>),
-    /// `{N}.{domain}` placeholder template: literal suffix with `{N}`
-    /// placeholders before it, each capturing one query label.
-    Template(TemplatePattern),
+    /// `{N}.{domain}` placeholder templates: one or more comma-separated
+    /// patterns (`"{1}.a.com,{1}.b.com"`), each a literal suffix with `{N}`
+    /// placeholders before it capturing one query label.  Any pattern
+    /// matching the query applies the rule.
+    Template(Vec<TemplatePattern>),
 }
 
 /// Parsed placeholder template, e.g. `{1}.example.com` →
@@ -84,7 +169,8 @@ pub struct TemplatePattern {
 /// - 空 / 缺省 / `*` → `MatchAll`
 /// - `group:{name}` → `Group`
 /// - 逗号分隔的内联域名集合（无大括号）→ `InlineDomains`
-/// - `{N}.{domain}` 占位符模板（`{N}` 之后必须有字面域名后缀）→ `Template`
+/// - `{N}.{domain}` 占位符模板（`{N}` 之后必须有字面域名后缀），可用逗号
+///   分隔多个模板（任一命中即应用规则）→ `Template`
 pub fn parse_match_target(s: &str) -> Result<MatchTarget, String> {
     let s = s.trim();
     if s.is_empty() || s == "*" {
@@ -97,21 +183,26 @@ pub fn parse_match_target(s: &str) -> Result<MatchTarget, String> {
         }
         return Ok(MatchTarget::Group(name.to_string()));
     }
-    // {N} 占位符模板
+    // {N} 占位符模板：逗号分隔的多个模板（任一命中即应用规则）；每段都须是
+    // 合法模板，否则配置错误。
     if s.contains('{') || s.contains('}') {
-        return parse_template(s);
+        let mut patterns = Vec::new();
+        for part in s.split(',') {
+            patterns.push(parse_template(part.trim())?);
+        }
+        return Ok(MatchTarget::Template(patterns));
     }
     // 逗号分隔的内联域名集合；单域名 = 单元素内联列表
     let domains = parse_inline_domains(s)?;
     Ok(MatchTarget::InlineDomains(domains))
 }
 
-/// 解析 `{N}.{domain}` 占位符模板。
+/// 解析单个 `{N}.{domain}` 占位符模板。
 ///
 /// 语法：开头是若干 `{N}`（N ≥ 1）占位符（点分隔），之后必须紧跟 `.`
 /// 加字面域名后缀（如 `.foo`、`.foo.bar`）；占位符只允许出现在后缀之前。
 /// 占位符之间必须以 `.` 分隔；字面后缀沿用域名校验。
-fn parse_template(s: &str) -> Result<MatchTarget, String> {
+fn parse_template(s: &str) -> Result<TemplatePattern, String> {
     let segments: Vec<&str> = s.split('.').collect();
     let mut placeholders = Vec::new();
     let mut idx = 0;
@@ -146,7 +237,7 @@ fn parse_template(s: &str) -> Result<MatchTarget, String> {
         ));
     }
     let suffix = validate_domain(&suffix).ok_or_else(|| format!("invalid match target {s:?}: bad domain suffix"))?;
-    Ok(MatchTarget::Template(TemplatePattern { suffix, placeholders }))
+    Ok(TemplatePattern { suffix, placeholders })
 }
 
 /// 校验并规范化一个域名（拒绝尾随点）；标签 `[a-z0-9-_]`，不允许前导/尾随
@@ -206,6 +297,8 @@ pub enum RuleAction {
         resolve_cname: bool,
         /// Fixed EDNS Client Subnet advertised to the upstream (RFC 7871).
         subnet: Option<ClientSubnet>,
+        /// Cloudflare ECH completion (`cloudflare_ech` config), if enabled.
+        cf_ech: Option<CfEch>,
     },
     Rewrite {
         target: String,
@@ -213,10 +306,48 @@ pub enum RuleAction {
     },
 }
 
+/// 聚合 forward 规则的查询行为参数（供 `forward_query` 使用；避免
+/// 逐个传参超出 clippy 的参数上限）。
+#[derive(Clone, Copy)]
+struct ForwardOpts<'a> {
+    ttl: Option<u32>,
+    max_answers: usize,
+    resolve_cname: bool,
+    subnet: Option<ClientSubnet>,
+    cf_ech: Option<&'a CfEch>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockResponse {
     NXDomain,
     Poison,
+}
+
+/// Cloudflare ECH completion config (`forward.cloudflare_ech`).
+///
+/// `template_name` is the literal domain whose HTTPS records carry the ECH
+/// template (e.g. `crypto.cloudflare.com`); it is queried through the same
+/// upstream and cached by TTL.
+#[derive(Debug, Clone)]
+pub struct CfEch {
+    pub template_name: String,
+}
+
+/// Parses the `cloudflare_ech` config value: a literal domain.  An invalid
+/// value logs a warning and disables the feature for that rule.
+fn parse_cf_ech(spec: Option<&str>) -> Option<CfEch> {
+    let s = spec?.trim();
+    if s.is_empty() {
+        warn!("rule forward cloudflare_ech: empty domain, disabled");
+        return None;
+    }
+    match validate_domain(s) {
+        Some(d) => Some(CfEch { template_name: d }),
+        None => {
+            warn!("rule forward cloudflare_ech: invalid domain {s:?}, disabled");
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -245,10 +376,16 @@ impl Rule {
             MatchTarget::MatchAll => true,
             MatchTarget::Group(name) => ctx.group.as_deref() == Some(name.as_str()),
             MatchTarget::InlineDomains(domains) => suffix_match_any(domains, domain),
-            MatchTarget::Template(t) => template_match(t, domain).is_some_and(|caps| {
-                ctx.captures = caps;
-                true
-            }),
+            MatchTarget::Template(patterns) => {
+                // 任一模板命中即应用规则；首个命中把捕获写入 ctx.captures。
+                for t in patterns {
+                    if let Some(caps) = template_match(t, domain) {
+                        ctx.captures = caps;
+                        return true;
+                    }
+                }
+                false
+            }
         }
     }
 }
@@ -408,6 +545,9 @@ pub struct Rules {
     /// Assembled named upstream pools (queried by forward/cname).
     upstreams: Arc<crate::upstream::Upstreams>,
     metrics: std::sync::OnceLock<RulesMetrics>,
+    /// Small TTL cache for Cloudflare ECH templates (only created when at
+    /// least one rule enables `cloudflare_ech`).
+    ech_cache: Option<Arc<DnsCache>>,
 }
 
 /// Builds the rules stage from the `rules:` config section (or none).
@@ -457,6 +597,7 @@ pub fn init(config: &Config, registry: &MetricsRegistry, upstreams: Arc<crate::u
                 deny_qtypes,
                 resolve_cname,
                 edns,
+                cloudflare_ech,
             } => RuleAction::Forward {
                 upstream: upstream.clone(),
                 ttl: *ttl,
@@ -464,6 +605,7 @@ pub fn init(config: &Config, registry: &MetricsRegistry, upstreams: Arc<crate::u
                 deny_qtypes: deny_qtypes.iter().map(|qt| parse_qtype(qt)).collect(),
                 resolve_cname: *resolve_cname,
                 subnet: parse_rule_edns(edns.as_deref()),
+                cf_ech: parse_cf_ech(cloudflare_ech.as_deref()),
             },
             RuleActionConfig::Rewrite { target, ttl } => RuleAction::Rewrite {
                 target: target.clone(),
@@ -474,11 +616,17 @@ pub fn init(config: &Config, registry: &MetricsRegistry, upstreams: Arc<crate::u
     }
     let inline_trie = build_inline_trie(&rules);
     let metrics = RulesMetrics::new(registry);
+    // 任一规则启用 cloudflare_ech 才建模板缓存。
+    let ech_cache = rules
+        .iter()
+        .any(|r| matches!(&r.action, RuleAction::Forward { cf_ech: Some(_), .. }))
+        .then(|| Arc::new(DnsCache::new_metric(64, 60, 3600, false)));
     Rules {
         rules,
         inline_trie,
         upstreams,
         metrics: std::sync::OnceLock::from(metrics),
+        ech_cache,
     }
 }
 
@@ -613,6 +761,7 @@ impl Rules {
                 deny_qtypes,
                 resolve_cname,
                 subnet,
+                cf_ech,
             } => {
                 if deny_qtypes.contains(&ctx.qtype()) {
                     let action_label = format!("forward-nodata({upstream})");
@@ -637,10 +786,14 @@ impl Rules {
                     if let Some(m) = self.metrics.get() {
                         m.matched_total.with_label_values(&["forward"]).inc();
                     }
-                    match self
-                        .forward_query(ctx, upstream, *ttl, *max_answers, *resolve_cname, *subnet)
-                        .await
-                    {
+                    let opts = ForwardOpts {
+                        ttl: *ttl,
+                        max_answers: *max_answers,
+                        resolve_cname: *resolve_cname,
+                        subnet: *subnet,
+                        cf_ech: cf_ech.as_ref(),
+                    };
+                    match self.forward_query(ctx, upstream, opts).await {
                         Ok(()) => Step::Respond,
                         Err(e) => {
                             warn!("forward {} for {} failed: {}", upstream, ctx.name(), e);
@@ -675,31 +828,68 @@ impl Rules {
     /// 查询 `upstream` 并写入 `ctx.response`；应用 TTL 覆盖与 answer 数目
     /// 截断（`max_answers`，`0` = 不限）。返回 `Ok` 表示拿到了上游响应。
     /// 当 `resolve_cname` 开启且上游应答首条为 CNAME 时，先按 §`resolve_cnames`
-    /// 主动解析 target（在 TTL 覆盖与截断之前）。
-    async fn forward_query(
-        &self,
-        ctx: &mut QueryContext,
-        upstream: &str,
-        ttl: Option<u32>,
-        max_answers: usize,
-        resolve_cname: bool,
-        subnet: Option<ClientSubnet>,
-    ) -> io::Result<()> {
+    /// 主动解析 target；随后若 `cf_ech` 启用，对落在 CF 网段且缺 `ech` 的
+    /// HTTPS answer 做 ECH 补全（都在 TTL 覆盖与截断之前）。
+    async fn forward_query(&self, ctx: &mut QueryContext, upstream: &str, opts: ForwardOpts<'_>) -> io::Result<()> {
         let mut msg = ctx.msg.clone();
-        if let Some(subnet) = subnet {
+        if let Some(subnet) = opts.subnet {
             crate::upstream::apply_edns(&mut msg, &subnet);
         }
         let resp = self.upstreams.query(upstream, &msg).await?;
         let mut resp = resp;
-        if resolve_cname {
-            self.resolve_cnames(ctx, upstream, &mut resp, subnet).await;
+        if opts.resolve_cname {
+            self.resolve_cnames(ctx, upstream, &mut resp, opts.subnet).await;
         }
-        if let Some(ttl) = ttl {
+        if let Some(cf) = opts.cf_ech {
+            // 只在对 CF 网段内且缺 ech 的 HTTPS answer 存在时才取模板，
+            // 避免非 HTTPS 查询 / 无候选应答多一次上游 HTTPS 往返。
+            if resp.answers.iter().any(record_uses_cf) {
+                if let Some(template) = self.fetch_ech_template(upstream, &cf.template_name).await {
+                    let query_name = ctx.msg.queries.first().map(|q| q.name()).unwrap();
+                    resp.answers = cf_ech_replacement_https(&resp.answers, &template, query_name);
+                }
+            }
+        }
+        if let Some(ttl) = opts.ttl {
             rewrite_ttl_in_response(&mut resp, ttl);
         }
-        truncate_answers(&mut resp, max_answers);
+        truncate_answers(&mut resp, opts.max_answers);
         ctx.response = Some(resp);
         Ok(())
+    }
+
+    /// 获取 `cloudflare_ech` 模板：先查私有缓存（`(domain, HTTPS)`），miss 时
+    /// 用同一 upstream 查询 HTTPS 记录并写回缓存。返回第一条含 `ech`
+    /// SvcParam 的 HTTPS 记录；任何失败返回 `None`（调用方保留原应答）。
+    async fn fetch_ech_template(&self, upstream: &str, domain: &str) -> Option<SVCB> {
+        let cache = self.ech_cache.as_ref()?;
+        let key = CacheKey::new(domain, RecordType::HTTPS);
+        match cache.get_cached(&key).await {
+            crate::plugins::cache::CacheResult::Fresh(entry) => {
+                return first_ech_svcb_from_cache(&entry.records);
+            }
+            crate::plugins::cache::CacheResult::Miss => {}
+        }
+        let template_msg = match make_query_msg(domain, RecordType::HTTPS) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("cloudflare_ech: invalid template domain {domain:?}: {e}");
+                return None;
+            }
+        };
+        let resp = match self.upstreams.query(upstream, &template_msg).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("cloudflare_ech: query {domain:?} failed: {e}, keep original response");
+                return None;
+            }
+        };
+        // 模板写回缓存（HTTPS 提取 / NoData 负缓存复用主 cache 路径）。
+        cache_upstream_response(cache, &key, &resp, None).await;
+        match cache.get_cached(&key).await {
+            crate::plugins::cache::CacheResult::Fresh(entry) => first_ech_svcb_from_cache(&entry.records),
+            crate::plugins::cache::CacheResult::Miss => None,
+        }
     }
 
     /// `forward.resolve_cname`：当应答**首条**是 CNAME 时，用同一 upstream
@@ -707,8 +897,10 @@ impl Rules {
     /// `docs/design/2026-08-27-rsdns-forward-resolve-cname.md`）。
     ///
     /// 若开头连续多条都是 CNAME（纯 CNAME 链），**只处理最后一条**：直接解析
-    /// 最后一个 target，跳过多级中间链。解析返回 A/AAAA → 用其替换整条 CNAME
-    /// 链（owner 改写为原查询名.
+    /// 最后一个 target，跳过多级中间链。应答已自带完整链（链末 CNAME 的 target
+    /// 与末尾非 CNAME 的 A/AAAA owner 相同）时不发起二次查询，直接删除 CNAME
+    /// 链并改写 A/AAAA 的 owner（`chain_completed_with_address`）。
+    /// 其余情况：解析返回 A/AAAA → 用其替换整条 CNAME 链（owner 改写为原查询名）；
     /// 返回空 / 返回 CNAME / 其他类型 / 解析出错 → 原样保留当前响应并结束（不追链）。
     async fn resolve_cnames(
         &self,
@@ -723,6 +915,16 @@ impl Rules {
         let RData::CNAME(cname) = &resp.answers[idx].data else {
             return;
         };
+
+        // 快速路径：上游应答已自带完整链（链末 CNAME 的 target == 末尾非 CNAME
+        // 记录的 owner，且该记录是 A/AAAA），无需再发起二次查询——直接删除 CNAME
+        // 链并把 A/AAAA 的 owner 改写为原查询名。
+        if chain_completed_with_address(&resp.answers) {
+            let query_name = ctx.msg.queries.first().map(|q| q.name()).unwrap();
+            collapse_completed_chain(resp, query_name);
+            return;
+        }
+
         let target = cname.0.to_utf8();
         let mut target_msg = match make_query_msg(&target, ctx.qtype()) {
             Ok(msg) => msg,
@@ -847,6 +1049,29 @@ fn last_cname_index(answers: &[Record]) -> Option<usize> {
     Some(idx - 1)
 }
 
+/// 上游应答是否**已自带完整链**：开头连续 CNAME 链最后一条的 target 与应答
+/// 最后一个非 CNAME 记录的 owner 相同（且该记录是 A/AAAA）。
+///
+/// 此时上游已递归到最终地址（如 `www CNAME cdn, cdn A 1.2.3.4`），无需再发起
+/// 二次查询；直接删除 CNAME 链并把 A/AAAA 的 owner 改写为原查询名即可。
+/// 最后一个非 CNAME 不是 A/AAAA（如 MX/TXT）、target 不相同、或纯 CNAME 链
+/// （无任何非 CNAME 记录）都返回 `false`，走原有 resolve 路径。
+fn chain_completed_with_address(answers: &[Record]) -> bool {
+    let Some(last_cname) = last_cname_index(answers) else {
+        return false;
+    };
+    let Some(last_data) = answers.iter().rposition(|r| r.record_type() != RecordType::CNAME) else {
+        return false;
+    };
+    if !matches!(answers[last_data].record_type(), RecordType::A | RecordType::AAAA) {
+        return false;
+    }
+    let RData::CNAME(cname) = &answers[last_cname].data else {
+        return false;
+    };
+    cname.0.eq_ignore_root(&answers[last_data].name)
+}
+
 /// 从解析结果中过滤出 A/AAAA 记录，并把 owner name 改写为 `owner`（原查询名）。
 fn address_records_with_owner(resolved: &Message, owner: &Name) -> Vec<Record> {
     resolved
@@ -859,6 +1084,81 @@ fn address_records_with_owner(resolved: &Message, owner: &Name) -> Vec<Record> {
             rec
         })
         .collect()
+}
+
+/// 折叠上游**已自带完整链**的应答：删除开头连续 CNAME 链，把剩余 A/AAAA
+/// 记录的 owner 改写为 `owner`（原查询名）。调用方保证应答满足
+/// `chain_completed_with_address`（链末 CNAME 的 target 与末尾 A/AAAA 的
+/// owner 相同）；尾部其余非 A/AAAA 记录（实践中极少出现）保持原样不动。
+fn collapse_completed_chain(resp: &mut Message, owner: &Name) {
+    let keep_from = last_cname_index(&resp.answers).map_or(0, |i| i + 1);
+    let tail = resp.answers.split_off(keep_from);
+    resp.answers = tail
+        .into_iter()
+        .map(|mut rec| {
+            if matches!(rec.record_type(), RecordType::A | RecordType::AAAA) {
+                rec.name = owner.clone();
+            }
+            rec
+        })
+        .collect();
+}
+
+// ---------------------------------------------------------------------------
+// Cloudflare ECH completion 纯函数辅助（forward.cloudflare_ech）
+// ---------------------------------------------------------------------------
+
+/// 判断一条 HTTPS answer 是否是 "CF 网段内且缺 ech" 的替换候选：
+/// RDATA 为 HTTPS(SVCB)，`ipv4hint` 中至少一个 IPv4 落在内置 CF 网段内，
+/// 且不含 `ech` SvcParam。其余（非 HTTPS / 无 ipv4hint / 已含 ech / 网段外）
+/// 一律返回 `false`。
+fn record_uses_cf(r: &Record) -> bool {
+    let RData::HTTPS(svcb) = &r.data else {
+        return false;
+    };
+    let mut in_cf = false;
+    let mut has_ech = false;
+    for (key, value) in &svcb.svc_params {
+        match (key, value) {
+            (SvcParamKey::EchConfigList, _) => has_ech = true,
+            (SvcParamKey::Ipv4Hint, SvcParamValue::Ipv4Hint(IpHint(ips))) => {
+                in_cf |= ips.iter().any(|ip| is_cloudflare_ip(ip.0));
+            }
+            _ => {}
+        }
+    }
+    in_cf && !has_ech
+}
+
+/// 逐条处理 HTTPS answers：`record_uses_cf` 命中的记录替换为模板 `template`
+/// 构造的新 HTTPS 记录（owner = `query_name`，TTL = 原记录 TTL）；其余记录
+/// 原样保留。
+fn cf_ech_replacement_https(records: &[Record], template: &SVCB, query_name: &Name) -> Vec<Record> {
+    records
+        .iter()
+        .map(|r| {
+            if record_uses_cf(r) {
+                let ttl = r.ttl;
+                Record::from_rdata(query_name.clone(), ttl, RData::HTTPS(HTTPS(template.clone())))
+            } else {
+                r.clone()
+            }
+        })
+        .collect()
+}
+
+/// 从缓存记录中取第一条含 `ech` 的 HTTPS SVCB（缓存值直接来自
+/// `CacheRecord::Https`）。
+fn first_ech_svcb_from_cache(records: &[CacheRecord]) -> Option<SVCB> {
+    records.iter().find_map(|rec| match rec {
+        CacheRecord::Https(svcb) if svcb_has_ech(svcb) => Some(svcb.clone()),
+        _ => None,
+    })
+}
+
+/// SVCB 是否含 `ech` SvcParam。
+fn svcb_has_ech(svcb: &SVCB) -> bool {
+    svcb.svc_params.iter().any(|(k, _)| *k == SvcParamKey::EchConfigList)
 }
 
 // ---------------------------------------------------------------------------
@@ -916,32 +1216,115 @@ mod tests {
         };
         assert_eq!(
             tpl("{1}.example.com"),
-            TemplatePattern {
+            vec![TemplatePattern {
                 suffix: "example.com".into(),
                 placeholders: vec![1],
-            }
+            }]
         );
         assert_eq!(
             tpl("{2}.example.com"),
-            TemplatePattern {
+            vec![TemplatePattern {
                 suffix: "example.com".into(),
                 placeholders: vec![2],
-            }
+            }]
         );
         assert_eq!(
             tpl("{1}.foo.bar"),
-            TemplatePattern {
+            vec![TemplatePattern {
                 suffix: "foo.bar".into(),
                 placeholders: vec![1],
-            }
+            }]
         );
         assert_eq!(
             tpl("{1}.{2}.foo.bar"),
-            TemplatePattern {
+            vec![TemplatePattern {
                 suffix: "foo.bar".into(),
                 placeholders: vec![1, 2],
-            }
+            }]
         );
+    }
+
+    #[test]
+    fn test_parse_template_list() {
+        // 逗号分隔的多个模板：任一命中即应用规则。
+        assert_eq!(
+            parse_ok("{1}.a.com,{1}.b.com"),
+            MatchTarget::Template(vec![
+                TemplatePattern {
+                    suffix: "a.com".into(),
+                    placeholders: vec![1],
+                },
+                TemplatePattern {
+                    suffix: "b.com".into(),
+                    placeholders: vec![1],
+                },
+            ])
+        );
+        // 逗号 + 空格容忍；每段独立解析（不同占位符数 / 后缀深度）。
+        assert_eq!(
+            parse_ok("{1}.a.com, {2}.b.example.com"),
+            MatchTarget::Template(vec![
+                TemplatePattern {
+                    suffix: "a.com".into(),
+                    placeholders: vec![1],
+                },
+                TemplatePattern {
+                    suffix: "b.example.com".into(),
+                    placeholders: vec![2],
+                },
+            ])
+        );
+        // 含逗号但无占位符 → 仍是内联域名集合（回落路径，行为不变）。
+        assert_eq!(
+            parse_ok("a.com,b.com"),
+            MatchTarget::InlineDomains(vec!["a.com".into(), "b.com".into()])
+        );
+    }
+
+    #[test]
+    fn test_rule_matches_template_list() {
+        use crate::plugins::cache::CacheKey;
+        use std::net::SocketAddr;
+        use std::time::Instant;
+
+        let rule = Rule {
+            target: parse_ok("{1}.a.com,{1}.b.com"),
+            qtype: None,
+            action: RuleAction::Rewrite {
+                target: "{1}.32.0.2".into(),
+                ttl: 300,
+            },
+        };
+        let ctx = |name: &str| {
+            let msg = make_query_msg(name, RecordType::A).unwrap();
+            QueryContext::new(
+                msg,
+                CacheKey::new(name, RecordType::A),
+                SocketAddr::from_str("127.0.0.1:5353").unwrap(),
+                "udp",
+                Instant::now(),
+                0,
+            )
+        };
+
+        // 命中第一个模板
+        let mut c = ctx("node1.a.com");
+        assert!(rule.matches(&mut c));
+        assert_eq!(c.captures, vec!["node1".to_string()]);
+
+        // 命中第二个模板
+        let mut c = ctx("node2.b.com");
+        assert!(rule.matches(&mut c));
+        assert_eq!(c.captures, vec!["node2".to_string()]);
+
+        // {1} 捕获后缀前紧邻 label，与单模板语义一致
+        let mut c = ctx("x.node3.a.com");
+        assert!(rule.matches(&mut c));
+        assert_eq!(c.captures, vec!["node3".to_string()]);
+
+        // 两个后缀都不命中
+        let mut c = ctx("node1.c.com");
+        assert!(!rule.matches(&mut c));
     }
 
     #[test]
@@ -970,6 +1353,11 @@ mod tests {
             "{1}..example.com",
             "{1}.example..com",
             "{1}.-bad.com",
+            // 逗号分隔的模板：任一段非法 → 整体配置错误
+            "{1}.a.com,",
+            ",{1}.a.com",
+            "{1}.a.com,{1}",
+            "cdn.{1}.a.com,{1}.b.com",
         ] {
             assert!(parse_match_target(bad).is_err(), "should reject: {bad:?}");
         }
@@ -1198,5 +1586,260 @@ mod tests {
         assert_eq!(recs[0].name, owner);
         assert_eq!(recs[1].record_type(), RecordType::AAAA);
         assert_eq!(recs[1].name, owner);
+    }
+
+    #[test]
+    fn test_chain_completed_with_address() {
+        let cname = |name: &str, target: &str| {
+            Record::from_rdata(
+                Name::from_utf8(name).unwrap(),
+                300,
+                RData::CNAME(CNAME(Name::from_utf8(target).unwrap())),
+            )
+        };
+        let a = |name: &str, ip: u8| {
+            Record::from_rdata(Name::from_utf8(name).unwrap(), 300, RData::A(A(Ipv4Addr::new(10, 0, 0, ip))))
+        };
+        let mx = |name: &str| {
+            Record::from_rdata(
+                Name::from_utf8(name).unwrap(),
+                300,
+                RData::MX(hickory_proto::rr::rdata::MX::new(10, Name::from_utf8("mail").unwrap())),
+            )
+        };
+
+        // 链末 CNAME target == 末尾 A 的 owner → 完整链
+        assert!(chain_completed_with_address(&[
+            cname("a.com", "b.com"),
+            cname("b.com", "cdn.com"),
+            a("cdn.com", 1),
+            a("cdn.com", 2),
+        ]));
+        // 末尾非 CNAME 是 AAAA 也视为完整链
+        let mut aaaa_msg = make_query_msg("a.com", RecordType::AAAA).unwrap();
+        aaaa_msg.answers.push(Record::from_rdata(
+            Name::from_utf8("cdn.com").unwrap(),
+            300,
+            RData::AAAA(AAAA(Ipv6Addr::LOCALHOST)),
+        ));
+        assert!(chain_completed_with_address(&[
+            cname("a.com", "cdn.com"),
+            aaaa_msg.answers[0].clone(),
+        ]));
+
+        // 末尾非 CNAME 的 owner 与链末 target 不同 → 需二次 resolve
+        assert!(!chain_completed_with_address(&[cname("a.com", "cdn.com"), a("other.com", 1),]));
+        // 末尾非 CNAME 不是 A/AAAA（如 MX）→ 需二次 resolve
+        assert!(!chain_completed_with_address(&[cname("a.com", "cdn.com"), mx("cdn.com"),]));
+        // 纯 CNAME 链（无任何非 CNAME 记录）→ 需二次 resolve
+        assert!(!chain_completed_with_address(&[
+            cname("a.com", "b.com"),
+            cname("b.com", "c.com")
+        ]));
+        // 首条非 CNAME → 不处理
+        assert!(!chain_completed_with_address(&[a("a.com", 1)]));
+        // 空应答 → 不处理
+        assert!(!chain_completed_with_address(&[]));
+    }
+
+    #[test]
+    fn test_collapse_completed_chain() {
+        let cname = |name: &str, target: &str| {
+            Record::from_rdata(
+                Name::from_utf8(name).unwrap(),
+                300,
+                RData::CNAME(CNAME(Name::from_utf8(target).unwrap())),
+            )
+        };
+        let a = |name: &str, ip: u8| {
+            Record::from_rdata(Name::from_utf8(name).unwrap(), 300, RData::A(A(Ipv4Addr::new(10, 0, 0, ip))))
+        };
+
+        // 完整链：删除 CNAME 链，A/AAAA owner 改写为原查询名
+        let mut msg = make_query_msg("a.com", RecordType::A).unwrap();
+        msg.answers.extend([
+            cname("a.com", "b.com"),
+            cname("b.com", "cdn.com"),
+            a("cdn.com", 1),
+            a("cdn.com", 2),
+        ]);
+        let owner = Name::from_utf8("queried.com").unwrap();
+        collapse_completed_chain(&mut msg, &owner);
+        assert_eq!(msg.answers.len(), 2);
+        for rec in &msg.answers {
+            assert_eq!(rec.record_type(), RecordType::A);
+            assert_eq!(rec.name, owner);
+        }
+    }
+
+    // ---- forward.cloudflare_ech ----
+
+    /// 构造一条 HTTPS answer：`ip` 作为 ipv4hint，`ech` 控制是否携带 ech。
+    fn https_record(name: &str, ttl: u32, ip: Option<Ipv4Addr>, ech: bool) -> Record {
+        let mut params = Vec::new();
+        if let Some(ip) = ip {
+            params.push((SvcParamKey::Ipv4Hint, SvcParamValue::Ipv4Hint(IpHint(vec![A(ip)]))));
+        }
+        if ech {
+            params.push((
+                SvcParamKey::EchConfigList,
+                SvcParamValue::EchConfigList(hickory_proto::rr::rdata::svcb::EchConfigList(vec![1, 2, 3])),
+            ));
+        }
+        let svcb = SVCB::new(1, Name::from_utf8(name).unwrap(), params);
+        Record::from_rdata(Name::from_utf8(name).unwrap(), ttl, RData::HTTPS(HTTPS(svcb)))
+    }
+
+    #[test]
+    fn test_cidr_contains() {
+        let cidr = Ipv4Cidr::parse("104.16.0.0/13");
+        // 网段内
+        assert!(cidr.contains(Ipv4Addr::new(104, 16, 0, 0)));
+        assert!(cidr.contains(Ipv4Addr::new(104, 23, 255, 255)));
+        // 边界外
+        assert!(!cidr.contains(Ipv4Addr::new(104, 15, 255, 255)));
+        assert!(!cidr.contains(Ipv4Addr::new(104, 24, 0, 0)));
+        // /0
+        let all = Ipv4Cidr::parse("0.0.0.0/0");
+        assert!(all.contains(Ipv4Addr::new(8, 8, 8, 8)));
+        assert!(all.contains(Ipv4Addr::new(255, 255, 255, 255)));
+        // /32
+        let one = Ipv4Cidr::parse("1.2.3.4/32");
+        assert!(one.contains(Ipv4Addr::new(1, 2, 3, 4)));
+        assert!(!one.contains(Ipv4Addr::new(1, 2, 3, 5)));
+    }
+
+    #[test]
+    fn test_is_cloudflare_ip() {
+        // CF 网段内（104.16.0.0/13、172.64.0.0/13、162.158.0.0/15）
+        assert!(is_cloudflare_ip(Ipv4Addr::new(104, 16, 0, 1)));
+        assert!(is_cloudflare_ip(Ipv4Addr::new(172, 64, 0, 1)));
+        assert!(is_cloudflare_ip(Ipv4Addr::new(162, 158, 0, 1)));
+        assert!(is_cloudflare_ip(Ipv4Addr::new(173, 245, 48, 1)));
+        // 网段外
+        assert!(!is_cloudflare_ip(Ipv4Addr::new(8, 8, 8, 8)));
+        assert!(!is_cloudflare_ip(Ipv4Addr::new(1, 1, 1, 1)));
+        assert!(!is_cloudflare_ip(Ipv4Addr::new(203, 0, 113, 1)));
+    }
+
+    #[test]
+    fn test_record_uses_cf() {
+        // CF 网段内 + 无 ech → 候选
+        assert!(record_uses_cf(&https_record(
+            "a.com",
+            300,
+            Some(Ipv4Addr::new(104, 16, 0, 1)),
+            false
+        )));
+        // 网段外 → 不是候选
+        assert!(!record_uses_cf(&https_record(
+            "a.com",
+            300,
+            Some(Ipv4Addr::new(8, 8, 8, 8)),
+            false
+        )));
+        // 无 ipv4hint → 不是候选
+        assert!(!record_uses_cf(&https_record("a.com", 300, None, false)));
+        // 已含 ech → 不是候选（即使 CF 网段内）
+        assert!(!record_uses_cf(&https_record(
+            "a.com",
+            300,
+            Some(Ipv4Addr::new(104, 16, 0, 1)),
+            true
+        )));
+        // 非 HTTPS → 不是候选
+        let a_rec = Record::from_rdata(Name::from_utf8("a.com").unwrap(), 300, RData::A(A(Ipv4Addr::new(1, 2, 3, 4))));
+        assert!(!record_uses_cf(&a_rec));
+    }
+
+    #[test]
+    fn test_cf_ech_replacement_https() {
+        let query_name = Name::from_utf8("queried.com").unwrap();
+        // 模板：携带 ech
+        let template = SVCB::new(
+            1,
+            Name::from_utf8("crypto.cloudflare.com").unwrap(),
+            vec![(
+                SvcParamKey::EchConfigList,
+                SvcParamValue::EchConfigList(hickory_proto::rr::rdata::svcb::EchConfigList(vec![9, 9])),
+            )],
+        );
+
+        let in_cf = https_record("cf.example.com", 120, Some(Ipv4Addr::new(104, 16, 0, 1)), false);
+        let outside = https_record("other.example.com", 120, Some(Ipv4Addr::new(8, 8, 8, 8)), false);
+        let has_ech = https_record("ech.example.com", 120, Some(Ipv4Addr::new(104, 16, 0, 2)), true);
+        let a_rec = Record::from_rdata(
+            Name::from_utf8("a.example.com").unwrap(),
+            300,
+            RData::A(A(Ipv4Addr::new(1, 2, 3, 4))),
+        );
+
+        let out = cf_ech_replacement_https(
+            &[in_cf, outside.clone(), has_ech.clone(), a_rec.clone()],
+            &template,
+            &query_name,
+        );
+        assert_eq!(out.len(), 4);
+
+        // 命中的那条被替换：owner = 查询名、TTL = 原 120、RDATA = 模板（含 ech）
+        let RData::HTTPS(svcb) = &out[0].data else {
+            panic!("expected HTTPS");
+        };
+        assert_eq!(out[0].name, query_name);
+        assert_eq!(out[0].ttl, 120);
+        assert!(svcb_has_ech(svcb));
+        assert_eq!(svcb.target_name.to_utf8(), "crypto.cloudflare.com");
+
+        // 其余原样保留
+        assert_eq!(out[1].data, outside.data);
+        assert_eq!(out[1].name, outside.name);
+        assert_eq!(out[2].data, has_ech.data);
+        assert_eq!(out[3].data, a_rec.data);
+    }
+
+    #[test]
+    fn test_cf_ech_no_candidate_returns_same_records() {
+        // 全部非候选 → 原样返回（不 clone 模板、不触发查询）
+        let query_name = Name::from_utf8("queried.com").unwrap();
+        let template = SVCB::new(
+            1,
+            Name::from_utf8("crypto.cloudflare.com").unwrap(),
+            vec![(
+                SvcParamKey::EchConfigList,
+                SvcParamValue::EchConfigList(hickory_proto::rr::rdata::svcb::EchConfigList(vec![9])),
+            )],
+        );
+        let outside = https_record("a.com", 120, Some(Ipv4Addr::new(8, 8, 8, 8)), false);
+        let out = cf_ech_replacement_https(std::slice::from_ref(&outside), &template, &query_name);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].data, outside.data);
+    }
+
+    #[test]
+    fn test_parse_cf_ech() {
+        // 合法字面域名
+        let cf = parse_cf_ech(Some("crypto.cloudflare.com")).expect("valid domain parses");
+        assert_eq!(cf.template_name, "crypto.cloudflare.com");
+        // 缺省 → None
+        assert!(parse_cf_ech(None).is_none());
+        // 非法（空 / 占位符 / 非法字符）→ None
+        assert!(parse_cf_ech(Some("")).is_none());
+        assert!(parse_cf_ech(Some("   ")).is_none());
+        assert!(parse_cf_ech(Some("{1}.example.com")).is_none());
+        assert!(parse_cf_ech(Some("bad domain.com")).is_none());
+        assert!(parse_cf_ech(Some(".x")).is_none());
+    }
+
+    #[test]
+    fn test_svcb_has_ech() {
+        assert!(svcb_has_ech(&SVCB::new(
+            1,
+            Name::from_utf8("a.com").unwrap(),
+            vec![(
+                SvcParamKey::EchConfigList,
+                SvcParamValue::EchConfigList(hickory_proto::rr::rdata::svcb::EchConfigList(vec![1])),
+            )]
+        )));
+        assert!(!svcb_has_ech(&SVCB::new(1, Name::from_utf8("a.com").unwrap(), vec![])));
     }
 }

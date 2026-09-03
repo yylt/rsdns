@@ -3,7 +3,7 @@
 //! The top-level [`Config`] mirrors `rsdns.yaml`.  The structural sections
 //! (`binds`, `groups`, `upstreams`) are arrays read directly by the server /
 //! pipeline stages, while every other top-level key (`rules`, `cache`,
-//! `log`, `hosts`, `metrics`, …) is captured verbatim in
+//! `log`, `hosts`, `ui`, …) is captured verbatim in
 //! [`Config::plugin_sections`] and consumed by the corresponding stage.
 //!
 //! The `upstreams` section is deserialized into [`Config::upstreams`] using
@@ -20,6 +20,15 @@ pub struct Config {
     /// Listen addresses: `"0.0.0.0:53"` for UDP, `"tcp://0.0.0.0:53"` for TCP.
     #[serde(default)]
     pub binds: Vec<BindConfig>,
+    /// Server TLS certificate PEM file path, shared by all `tls://` (DoT),
+    /// `https://` (DoH) and `h3://` (DoH3) binds.  May contain the leaf
+    /// certificate followed by intermediate chain certificates.
+    #[serde(default)]
+    pub tls_cert: Option<String>,
+    /// Server TLS private key PEM file path (PKCS#8 / RSA / EC), paired with
+    /// `tls_cert`.
+    #[serde(default)]
+    pub tls_key: Option<String>,
     /// Domain groups (array, config order = match priority).
     #[serde(default)]
     pub groups: Vec<GroupConfig>,
@@ -173,7 +182,9 @@ pub struct RuleConfig {
     /// Match target: empty/missing/`*` = match all, `group:{name}`,
     /// `{a.com,b.com}` (inline set), or a `{N}.{domain}` placeholder
     /// template (e.g. `{1}.example.com`; `{N}` captures a query label and
-    /// can be reused in actions like `cname.target`).
+    /// can be reused in actions like `cname.target`).  Multiple templates
+    /// may be comma-separated (`"{1}.a.com,{1}.b.com"`); any one matching
+    /// applies the rule.
     /// Parsed at build time into a `MatchTarget`; invalid syntax is a config error.
     #[serde(default, alias = "r#match")]
     pub r#match: Option<String>,
@@ -228,10 +239,13 @@ pub enum RuleActionConfig {
         #[serde(default)]
         deny_qtypes: Vec<String>,
         /// When the upstream response's first answer is a CNAME, actively
-        /// resolve its target (same upstream, same qtype).  An A/AAAA result
-        /// replaces the CNAME (owner rewritten to the queried name); an empty
-        /// result drops it and continues with the next answer; a CNAME result
-        /// keeps the original response untouched (no further chaining).
+        /// resolve its target (same upstream, same qtype).  A chain the
+        /// response already completes with A/AAAA is collapsed in place
+        /// (CNAMEs dropped, A/AAAA owner rewritten to the queried name, no
+        /// follow-up query); otherwise an A/AAAA result replaces the CNAME
+        /// (owner rewritten to the queried name); an empty result drops it
+        /// and continues with the next answer; a CNAME result keeps the
+        /// original response untouched (no further chaining).
         #[serde(default)]
         resolve_cname: bool,
         /// Fixed EDNS Client Subnet (RFC 7871) advertised to the upstream,
@@ -240,6 +254,14 @@ pub enum RuleActionConfig {
         /// carries the ECS option.  Omitted → no EDNS option is added.
         #[serde(default)]
         edns: Option<String>,
+        /// Cloudflare ECH bootstrap domain (literal, e.g.
+        /// `crypto.cloudflare.com`).  When a HTTPS answer of this rule
+        /// carries an `ipv4hint` inside the built-in Cloudflare IPv4 ranges
+        /// but no `ech` SvcParam, the record is replaced by an HTTPS
+        /// template fetched from this domain (same upstream, cached by TTL).
+        /// Omitted → the feature is disabled for this rule.
+        #[serde(default)]
+        cloudflare_ech: Option<String>,
     },
     /// Rewrite the query with a synthesized IPv4 A answer (no upstream
     /// query).  `target` is a dotted-quad IPv4 (`10.10.0.0`) or a
@@ -430,8 +452,8 @@ hosts:
 rules:
   - match: ""
     action: { type: forward, upstream: default }
-metrics:
-  bind: "0.0.0.0:9153"
+ui:
+  bind: "127.0.0.1:8153"
 "#;
         let config = Config::from_yaml_str(yaml).expect("parse failed");
         assert_eq!(config.binds.len(), 2);
@@ -452,7 +474,7 @@ metrics:
         assert!(config.plugin_sections.contains_key("cache"));
         assert!(config.plugin_sections.contains_key("hosts"));
         assert!(config.plugin_sections.contains_key("rules"));
-        assert!(config.plugin_sections.contains_key("metrics"));
+        assert!(config.plugin_sections.contains_key("ui"));
     }
 
     #[test]
@@ -501,6 +523,32 @@ rules:
     }
 
     #[test]
+    fn test_forward_cloudflare_ech_parse() {
+        let yaml = r#"
+rules:
+  - match: ""
+    action: { type: forward, upstream: default, cloudflare_ech: "crypto.cloudflare.com" }
+  - match: ""
+    action: { type: forward, upstream: default }
+"#;
+        let config = Config::from_yaml_str(yaml).expect("parse failed");
+        let raw = config.plugin_sections.get("rules").cloned().unwrap();
+        let configs: Vec<RuleConfig> = serde_yaml::from_value(raw).unwrap();
+        match &configs[0].action {
+            RuleActionConfig::Forward { cloudflare_ech, .. } => {
+                assert_eq!(cloudflare_ech.as_deref(), Some("crypto.cloudflare.com"))
+            }
+            other => panic!("expected Forward, got {other:?}"),
+        }
+        match &configs[1].action {
+            RuleActionConfig::Forward { cloudflare_ech, .. } => {
+                assert!(cloudflare_ech.is_none(), "default must be None")
+            }
+            other => panic!("expected Forward, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_unknown_top_level_keys_go_to_plugin_sections() {
         let yaml = r#"
 binds:
@@ -518,6 +566,27 @@ some_future_plugin:
         assert_eq!(config.binds.len(), 1);
         assert_eq!(config.plugin_sections.len(), 1);
         assert!(config.plugin_sections.contains_key("some_future_plugin"));
+    }
+
+    #[test]
+    fn test_tls_cert_key_parse() {
+        // tls_cert / tls_key are typed top-level fields, not plugin sections.
+        let yaml = r#"
+binds:
+  - address: "tls://0.0.0.0:853"
+tls_cert: /etc/rsdns/server.crt
+tls_key: /etc/rsdns/server.key
+"#;
+        let config = Config::from_yaml_str(yaml).expect("parse failed");
+        assert_eq!(config.tls_cert.as_deref(), Some("/etc/rsdns/server.crt"));
+        assert_eq!(config.tls_key.as_deref(), Some("/etc/rsdns/server.key"));
+        assert!(!config.plugin_sections.contains_key("tls_cert"));
+        assert!(!config.plugin_sections.contains_key("tls_key"));
+
+        // Both absent → None; unknown keys still land in plugin_sections.
+        let config = Config::from_yaml_str("binds: [{ address: \"0.0.0.0:53\" }]\n").expect("parse failed");
+        assert!(config.tls_cert.is_none());
+        assert!(config.tls_key.is_none());
     }
 
     #[test]

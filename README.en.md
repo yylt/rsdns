@@ -16,12 +16,12 @@ A rule-driven standalone DNS server implemented in Rust, with composable listene
   - DoH3 (`h3://`)
   - DoQ (`quic://`)
 - **Query pipeline**: `hosts → groups → cache → rules`; unmatched queries fall back to NXDOMAIN/SERVFAIL
-- **Rules**: `block` (NXDomain or poison IP), `cname` (rewrite + recursive resolve), `forward` (named upstream pool, optional TTL override / resolve_cname), `rewrite` (synthesized A record)
+- **Rules**: `block` (NXDomain or poison IP), `cname` (rewrite + recursive resolve), `forward` (named upstream pool, optional TTL override / resolve_cname / cloudflare_ech completion), `rewrite` (synthesized A record)
 - **Cache**: LRU with configurable capacity and TTL clamping; per-entry TTL expiry via moka (no stale serving)
 - **Connection pool**: adaptive address rotation, cooldown on failure, address-family preference
 - **File sources**: `groups` / `hosts` support `file://` sources, auto-reloaded on change via `notify`
 - **systemd notify**: sends `READY=1` once all listeners are bound (`Type=notify`)
-- **metrics**: optional Prometheus `/metrics` HTTP endpoint
+- **ui**: optional built-in web status page + Prometheus `/metrics` (`ui:` config section; `/` is a mobile-friendly HTML dashboard, `/metrics` is the Prometheus text endpoint)
 
 ## Build
 

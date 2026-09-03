@@ -65,24 +65,25 @@ log:
 
 ### 3.2 文件命名与轮转
 
-固定主文件名 `query.log`，轮转后压缩为 `query.log.1.gz`、`query.log.2.gz`、
-…… 编号越大越旧：
+固定主文件名 `query.log`，每次轮转把当前文件 gzip 压缩为**顺次递增编号**
+的 `query.log.N.gz`（`N` 单调递增，已有归档**不重命名、不挪位**），编号
+越大越新：
 
 - 启动时：创建/截断 `dir/query.log`（追加写入）。
 - 写入累计达到 `maxsize`：当前文件先 `flush`+`sync`，然后整体 gzip 压缩为
-  `dir/query.log.1.gz`，原文件截断并继续追加；原有 `query.log.N.gz` 编号
-  +1 顺移，超过 `numfile-1` 个归档（即编号 > `numfile-1`）时删除。
-- 例如 `:5m:5`：保留 `query.log` + `query.log.1.gz` … `query.log.4.gz`
+  `dir/query.log.N.gz`（`N` = 现有归档最大编号 +1，首次为 1），原文件截断
+  继续追加；保留编号最大的 `numfile-1` 个归档，最旧（编号最小）的归档在
+  轮转后删除。
+- 例如 `:5m:5`：保留 `query.log` + 编号最大的 4 个 `query.log.N.gz`
   共 5 个文件，更旧归档删除。
 
-启动时若已存在 `query.log.1.gz` 等归档，直接沿用（不重命名、不删除）；
-仅对**当前写入周期内新产生的**归档执行编号顺移与淘汰，避免把历史归档
-挤掉。恢复计数从磁盘现有归档的最大编号 +1 开始（基于 `query.log.N.gz`
-的文件名扫描，无需维护元数据文件）。
+启动时若已存在 `query.log.N.gz` 等归档，直接沿用（不重命名、不删除），
+编号从磁盘现有归档的最大编号 +1 继续（基于 `query.log.N.gz` 的文件名
+扫描，无需维护元数据文件）。
 
 压缩流式边写边压：从当前文件头读到尾，经 `flate2` GzEncoder 逐块写入
-`.gz`，不整体载入内存；压缩完成后再截断原文件。归档文件名带写入时的
-时间戳，避免同名覆盖竞态（同一 `maxsize` 内多次轮转不会丢文件）。
+`.gz`，不整体载入内存；压缩完成后再截断原文件。顺次递增编号天然避免
+同名覆盖竞态（同一 `maxsize` 内多次轮转不会丢文件）。
 
 ### 3.3 并发模型
 
@@ -113,11 +114,11 @@ log:
   directory: '/var/log/rsdns'
 ```
 
-轮转后目录内容：
+轮转后目录内容（编号越大越新，最旧的会被淘汰）：
 
 ```text
 /var/log/rsdns/query.log        # 当前写入
-/var/log/rsdns/query.log.1.gz   # 最近归档
+/var/log/rsdns/query.log.1.gz   # 最早归档
 /var/log/rsdns/query.log.2.gz
 /var/log/rsdns/query.log.3.gz
 /var/log/rsdns/query.log.4.gz
@@ -128,7 +129,7 @@ log:
 | 文件 | 改动 |
 |---|---|
 | `src/config.rs` | `LogConfig` 增加 `directory: Option<String>`；`parse_log_directory()` 解析 `{dir}:{maxsize}:{numfile}`（默认 `" /var/log/rsdns:5m:5"`），含 `maxsize` 单位后缀解析 |
-| `src/plugins/logs.rs` | `QueryLogger` 增加目录写入分支：行级 `Mutex` 写入 + 大小累计 + 轮转（gzip 归档/编号顺移/淘汰）；stdout 路径不变 |
+| `src/plugins/logs.rs` | `QueryLogger` 增加目录写入分支：行级 `Mutex` 写入 + 大小累计 + 轮转（gzip 归档/顺次编号/淘汰最旧）；stdout 路径不变 |
 | `src/main.rs` | 启动时创建日志目录并打开初始文件（失败即报错退出） |
 | `example/rsdns-all-example.yaml` | `log:` 段补充 `directory` 示例与说明 |
 | `Cargo.toml` | 新增依赖 `flate2`（默认特性：std zlib，纯 Rust 实现） |
@@ -138,8 +139,9 @@ log:
 - 单元测试（`logs.rs`，`#[tokio::test]`）：
   - `parse_log_directory`：默认值、`k`/`m`/`g` 单位、裸数字、非法输入
     （缺段、`numfile=0`、目录为空、`maxsize=0`）→ 报错/回退默认；
-  - 轮转逻辑：写入超过 `maxsize` 后产生 `.1.gz`、当前文件被截断、
-    归档计数正确、超过 `numfile-1` 的旧归档被删除；
+  - 轮转逻辑：写入超过 `maxsize` 后产生 `.gz` 归档、当前文件被截断、
+    归档编号顺次递增（已有归档不重命名）、最旧归档被删除、重启后从最大
+    编号 +1 继续；
   - gzip 解压后内容与轮转前文件一致。
 - `make ci`（fmt + clippy + check + test）通过；`make build`（debug）通过。
 

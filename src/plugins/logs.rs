@@ -7,8 +7,10 @@
 //! Lines go either to stdout (async, buffered as `bytes::Bytes`) or, when
 //! `log.directory` is set (`{dir}:{maxsize}:{numfile}`), to a rotating file
 //! `dir/query.log`: once the active file reaches `maxsize` it is gzip
-//! archived as `query.log.N.gz` and a fresh file continues; at most
-//! `numfile` files (active + archives) are kept.  Directory-mode I/O runs
+//! archived as `query.log.N.gz` (N monotonically increasing, existing
+//! archives are never renamed) and a fresh file continues; at most
+//! `numfile` files (active + archives) are kept — the oldest (lowest-N)
+//! archives are pruned.  Directory-mode I/O runs
 //! through `tokio::fs` (never blocking a worker); gzip compression, being
 //! a synchronous `flate2` API, runs in `spawn_blocking`.
 
@@ -283,7 +285,7 @@ enum LogSink {
     Directory(tokio::sync::Mutex<RotatingFileSink>),
 }
 
-/// 轮转文件写入器：单行追加 + 大小累计 + 轮转（gzip 归档 / 编号顺移 /
+/// 轮转文件写入器：单行追加 + 大小累计 + 轮转（gzip 归档 / 顺次编号 /
 /// 超限删除）。所有文件操作走 `tokio::fs`（异步），由调用方确保互斥。
 struct RotatingFileSink {
     dir: PathBuf,
@@ -291,23 +293,28 @@ struct RotatingFileSink {
     numfile: usize,
     file: fs::File,
     written: u64,
+    /// 下一个归档编号（每次轮转递增，不重命名已有归档）。
+    next: u64,
 }
 
 impl RotatingFileSink {
     /// 打开 `dir` 下的轮转日志：创建目录，以追加模式打开/创建 `query.log`
-    /// 并回退到文件末尾累计已写字节（启动恢复计数）。
+    /// 并回退到文件末尾累计已写字节（启动恢复计数）；归档编号从现有归档的
+    /// 最大编号 +1 继续（沿用历史归档，不重命名）。
     async fn open(spec: LogDirectory) -> io::Result<Self> {
         let dir = PathBuf::from(&spec.dir);
         fs::create_dir_all(&dir).await?;
         let path = dir.join("query.log");
         let mut file = fs::OpenOptions::new().create(true).append(true).open(&path).await?;
         let written = file.seek(SeekFrom::End(0)).await?;
+        let next = max_archive_index(&dir).await + 1;
         Ok(Self {
             dir,
             maxsize: spec.maxsize,
             numfile: spec.numfile,
             file,
             written,
+            next,
         })
     }
 
@@ -323,13 +330,13 @@ impl RotatingFileSink {
         }
     }
 
-    /// 轮转：先把旧归档编号顺移/淘汰（腾出 `query.log.1.gz`），再把当前
-    /// `query.log` 整体 gzip 为 `query.log.1.gz`（`spawn_blocking` 中流式
-    /// 压缩），原文件截断继续追加。失败仅记 error，不中断服务。
+    /// 轮转：把当前 `query.log` 整体 gzip 为 `query.log.{next}.gz`
+    /// （`spawn_blocking` 中流式压缩），原文件截断继续追加；归档编号每次
+    /// 递增，已有归档不重命名，仅删除超限的最旧归档。失败仅记 error，
+    /// 不中断服务。
     async fn rotate(&mut self) {
-        self.collect().await;
         let src = self.dir.join("query.log");
-        let dst = self.dir.join("query.log.1.gz");
+        let dst = self.dir.join(format!("query.log.{}.gz", self.next));
         if let Err(e) = self.file.flush().await {
             log::error!("query log flush before rotate failed: {}", e);
         }
@@ -344,47 +351,26 @@ impl RotatingFileSink {
                     log::error!("query log rewind after rotate failed: {}", e);
                 }
                 self.written = 0;
+                self.next += 1;
+                self.prune().await;
             }
             Err(e) => log::error!("query log rotate failed: {}", e),
         }
     }
 
-    /// 归档编号顺移：`query.log.N.gz` → `query.log.(N+1).gz`，编号从大到小；
-    /// 顺移后编号超过 `numfile-1` 的归档删除。任一文件失败仅记 warning，
-    /// 继续处理其余。
-    async fn collect(&self) {
-        let mut archives: Vec<u64> = {
-            let mut entries = match fs::read_dir(&self.dir).await {
-                Ok(entries) => entries,
-                Err(e) => {
-                    log::warn!("query log: read_dir {:?}: {}", self.dir, e);
-                    return;
-                }
-            };
-            let mut idxs = Vec::new();
-            while let Some(entry) = entries.next_entry().await.transpose() {
-                match entry {
-                    Ok(entry) => {
-                        if let Some(idx) = archive_index(&entry.file_name()) {
-                            idxs.push(idx);
-                        }
-                    }
-                    Err(e) => log::warn!("query log: read_dir {:?}: {}", self.dir, e),
-                }
-            }
-            idxs
-        };
+    /// 删除超限的最旧归档：只保留编号最大的 `numfile-1` 个归档（当前
+    /// `query.log` 不计入）；已有归档不重命名、不挪位。任一文件失败仅记
+    /// warning，继续处理其余。
+    async fn prune(&self) {
+        let keep = (self.numfile - 1) as u64;
+        let mut archives = collect_archives(&self.dir).await;
         archives.sort_unstable();
-        let keep_max = (self.numfile - 1) as u64;
-        for &idx in archives.iter().rev() {
+        // 删除最旧的（编号最小）直到不超过 `keep` 个。
+        while archives.len() > keep as usize {
+            let idx = archives.remove(0);
             let from = self.dir.join(format!("query.log.{idx}.gz"));
-            let to = self.dir.join(format!("query.log.{}.gz", idx + 1));
-            if idx + 1 > keep_max {
-                if let Err(e) = fs::remove_file(&from).await {
-                    log::warn!("query log: remove old archive {:?}: {}", from, e);
-                }
-            } else if let Err(e) = fs::rename(&from, &to).await {
-                log::warn!("query log: shift archive {:?} → {:?}: {}", from, to, e);
+            if let Err(e) = fs::remove_file(&from).await {
+                log::warn!("query log: remove old archive {:?}: {}", from, e);
             }
         }
     }
@@ -412,6 +398,36 @@ fn archive_index(name: &std::ffi::OsStr) -> Option<u64> {
     let rest = s.strip_prefix("query.log.")?;
     let n = rest.strip_suffix(".gz")?;
     n.parse::<u64>().ok()
+}
+
+/// 列出 `dir` 下所有归档编号；`read_dir` 失败时记 warning 并返回空列表。
+async fn collect_archives(dir: &Path) -> Vec<u64> {
+    let mut entries = match fs::read_dir(dir).await {
+        Ok(entries) => entries,
+        Err(e) => {
+            log::warn!("query log: read_dir {:?}: {}", dir, e);
+            return Vec::new();
+        }
+    };
+    let mut idxs = Vec::new();
+    while let Some(entry) = entries.next_entry().await.transpose() {
+        match entry {
+            Ok(entry) => {
+                if let Some(idx) = archive_index(&entry.file_name()) {
+                    idxs.push(idx);
+                }
+            }
+            Err(e) => log::warn!("query log: read_dir {:?}: {}", dir, e),
+        }
+    }
+    idxs
+}
+
+/// 现有归档的最大编号；无归档时返回 0（供 `open` 从 1 开始编号）。
+async fn max_archive_index(dir: &Path) -> u64 {
+    let mut archives = collect_archives(dir).await;
+    archives.sort_unstable();
+    archives.pop().unwrap_or(0)
 }
 
 /// 将应答中的记录类型列表写入 `out`（逗号分隔），空应答写 `-`。
@@ -689,6 +705,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_rotate_numbers_monotonically_without_renaming() {
+        let dir = tmp_dir("monotonic");
+        let mut sink = RotatingFileSink::open(LogDirectory {
+            dir: dir.to_string_lossy().into_owned(),
+            maxsize: 4,
+            numfile: 5,
+        })
+        .await
+        .unwrap();
+
+        // 3 个轮转周期，每个 4 字节行；归档编号应顺次为 1、2、3，且已有
+        // 归档不被重命名（1.gz 始终是 1.gz）。
+        sink.write(b"aaaa").await;
+        sink.write(b"bbbb").await;
+        sink.write(b"cccc").await;
+        sink.write(b"dddd").await;
+        assert!(dir.join("query.log.1.gz").exists());
+        assert!(dir.join("query.log.2.gz").exists());
+        assert!(dir.join("query.log.3.gz").exists());
+
+        // 1.gz 内容是最早的归档，未被挪位。
+        let mut gz = flate2::read::GzDecoder::new(std::fs::File::open(dir.join("query.log.1.gz")).unwrap());
+        let mut content = String::new();
+        use std::io::Read;
+        gz.read_to_string(&mut content).unwrap();
+        assert_eq!(content, "aaaa");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn test_rotate_keeps_numfile_archives() {
         let dir = tmp_dir("numfile");
         let mut sink = RotatingFileSink::open(LogDirectory {
@@ -699,7 +746,8 @@ mod tests {
         .await
         .unwrap();
 
-        // 4 个归档周期 + 收尾写入；共应保留 query.log + 2 个 .gz。
+        // 4 个归档周期 + 收尾写入；共应保留 query.log + 2 个 .gz（编号最大
+        // 的两个：3、4），最旧的 1、2 号归档被删除。
         sink.write(b"aaaa").await;
         sink.write(b"bbbb").await;
         sink.write(b"cccc").await;
@@ -707,19 +755,49 @@ mod tests {
         sink.write(b"ee").await;
         assert_eq!(sink.written, 2);
 
-        assert!(dir.join("query.log.1.gz").exists());
-        assert!(dir.join("query.log.2.gz").exists());
-        assert!(!dir.join("query.log.3.gz").exists(), "超过 numfile-1 的归档被删除");
+        assert!(!dir.join("query.log.1.gz").exists(), "最旧归档被删除");
+        assert!(!dir.join("query.log.2.gz").exists(), "最旧归档被删除");
+        assert!(dir.join("query.log.3.gz").exists());
+        assert!(dir.join("query.log.4.gz").exists());
 
-        // 每个归档都能解压且长度正确。
-        for idx in 1..=2 {
-            let mut gz =
-                flate2::read::GzDecoder::new(std::fs::File::open(dir.join(format!("query.log.{idx}.gz"))).unwrap());
-            let mut content = String::new();
-            use std::io::Read;
-            gz.read_to_string(&mut content).unwrap();
-            assert_eq!(content.len(), 4, "archive {idx} content: {content:?}");
-        }
+        // 保留下来的归档内容正确（3 号 = "cccc"，4 号 = "dddd"）。
+        let mut gz = flate2::read::GzDecoder::new(std::fs::File::open(dir.join("query.log.3.gz")).unwrap());
+        let mut content = String::new();
+        use std::io::Read;
+        gz.read_to_string(&mut content).unwrap();
+        assert_eq!(content, "cccc");
+        let mut gz = flate2::read::GzDecoder::new(std::fs::File::open(dir.join("query.log.4.gz")).unwrap());
+        let mut content4 = String::new();
+        gz.read_to_string(&mut content4).unwrap();
+        assert_eq!(content4, "dddd");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_open_resumes_after_existing_archives() {
+        let dir = tmp_dir("resume");
+        // 预置两个归档 1.gz、3.gz（模拟历史归档）；下次编号应从最大编号 +1
+        // 即 4 开始，且已有归档不被重命名。
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("query.log.1.gz"), b"old1").unwrap();
+        std::fs::write(dir.join("query.log.3.gz"), b"old3").unwrap();
+
+        let mut sink = RotatingFileSink::open(LogDirectory {
+            dir: dir.to_string_lossy().into_owned(),
+            maxsize: 2,
+            numfile: 5,
+        })
+        .await
+        .unwrap();
+        assert_eq!(sink.next, 4, "编号从现有最大编号 +1 继续");
+
+        sink.write(b"aa").await;
+        sink.write(b"bb").await;
+        assert!(dir.join("query.log.4.gz").exists(), "新归档使用顺次编号 4");
+        // 历史归档保持原编号。
+        assert!(dir.join("query.log.1.gz").exists());
+        assert!(dir.join("query.log.3.gz").exists());
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -736,6 +814,7 @@ mod tests {
         .unwrap();
         sink.write(b"abc").await; // 第一行直接写入，即使超过 maxsize 也不轮转
         assert!(!dir.join("query.log.1.gz").exists());
+        assert_eq!(sink.next, 1, "未轮转则编号不前进");
         sink.file.flush().await.unwrap();
         assert_eq!(std::fs::read_to_string(dir.join("query.log")).unwrap(), "abc");
         std::fs::remove_dir_all(&dir).unwrap();

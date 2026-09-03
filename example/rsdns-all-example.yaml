@@ -3,13 +3,29 @@
 # (repo root is the rsdns crate root)
 #
 # Top-level sections: binds[] / groups[] / upstreams[] + plugin sections
-# (hosts / cache / rules / log / metrics).  Each plugin owns its own config
+# (hosts / cache / rules / log / ui).  Each plugin owns its own config
 # section and initializes from it.
 
-# Listen addresses: plain IP:port = UDP, tcp:// prefix = TCP
+# Listen addresses: plain IP:port = UDP, tcp:// prefix = TCP.
+# Encrypted listeners (TLS cert/key below, auto self-signed when omitted):
+#   tls://   → DoT (DNS-over-TLS, RFC 7858)
+#   https:// → DoH (DNS-over-HTTPS, RFC 8484; HTTP/1.1 + HTTP/2, path /dns-query)
+#   h3://    → DoH3 (DNS-over-HTTP/3; UDP socket, path /dns-query)
 binds:
   - address: "0.0.0.0:14453"          # UDP
   - address: "tcp://0.0.0.0:14453"    # TCP
+  # - address: "tls://0.0.0.0:8853"    # DoT
+  # - address: "https://0.0.0.0:8443"  # DoH (HTTP/1.1 + HTTP/2)
+  # - address: "h3://0.0.0.0:8443"     # DoH3 (HTTP/3)
+
+# Server TLS certificate/key for the tls:// / https:// / h3:// binds.
+# PEM files: cert may contain the leaf + intermediate chain; key is
+# PKCS#8 / RSA / EC.  Both must be set together.  When both are omitted and
+# at least one encrypted bind exists, an in-memory ECDSA P-256 self-signed
+# certificate (SAN: localhost + loopback/private IPs) is generated at
+# startup — enough for testing, not for production.
+# tls_cert: /etc/rsdns/server.crt
+# tls_key: /etc/rsdns/server.key
 
 # Domain groups: name + optional domains list (inline or file:// sources).
 # file:// sources are watched and reloaded automatically on change.
@@ -100,6 +116,8 @@ hosts:
 #   (empty)         → match all
 #   group:{name}    → group reference
 #   {a.com,b.com}   → inline domain set (no braces, comma separated)
+#   "{1}.a.com,{1}.b.com" → comma-separated placeholder templates (any one
+#                           matching applies the rule; captures shared)
 rules:
   # Block ad group with poison (A=0.0.0.0, AAAA=::)
   - match: "group:ad"
@@ -139,6 +157,18 @@ rules:
       max_answers: 5   # cap returned answers (default 5; 0 = no limit)
       edns: "203.0.113.0/24"   # 固定 EDNS Client Subnet (RFC 7871)，该规则的查询都通告此网段
 
+  # Forward with Cloudflare ECH completion (HTTPS queries): when an HTTPS
+  # answer's ipv4hint falls inside the built-in Cloudflare IPv4 ranges but
+  # carries no `ech` SvcParam, that record is replaced by an HTTPS template
+  # fetched from cloudflare_ech (same upstream, cached by TTL).
+  #   cloudflare_ech: 字面域名，通常用 crypto.cloudflare.com
+  - match: "cloudflare-cdn.example.com"
+    qtype: HTTPS
+    action:
+      type: forward
+      upstream: default
+      cloudflare_ech: "crypto.cloudflare.com"
+
   # Forward a CDN group's subdomains (inline suffix match:
   # cdn.cloudflare.com and below)
   - match: "cdn.cloudflare.com"
@@ -170,8 +200,10 @@ rules:
 #              {time} — query start time (wall-clock, local tz, DD/MM/YYYY:HH:MM:SS ±HHMM)
 # Output: stdout by default; set directory to write rotating files instead.
 #   directory: "{dir}:{maxsize}:{numfile}" — write to dir/query.log; when the
-#   active file reaches maxsize it is gzip-archived as query.log.N.gz and a
-#   fresh file starts; at most numfile files (active + archives) are kept.
+#   active file reaches maxsize it is gzip-archived as query.log.N.gz with N
+#   increasing monotonically (existing archives are never renamed) and a
+#   fresh file starts; at most numfile files (active + archives) are kept,
+#   the oldest (lowest-N) archives are pruned.
 #   maxsize supports k/K/m/M/g/G suffixes (5m = 5 MB).  A bare directory path
 #   (e.g. "/var/log/rsdns") uses the default maxsize/numfile (5m / 5 files).
 log:
@@ -194,9 +226,13 @@ speed:
   family: ANY
   timeout: 1s
 
-# Prometheus metrics endpoint (optional).  Registered metrics:
+# Built-in web UI (optional).  Serves two paths on one listener:
+#   /         mobile-friendly HTML dashboard (memory / cache / query metrics,
+#             colored rounded cards; auto-refreshes every 3s)
+#   /metrics  Prometheus text format (for scrapers)
+# Registered metrics:
 #   rsdns_logs_*, rsdns_hosts_*, rsdns_groups_*, rsdns_cache_*,
-#   rsdns_rules_*, rsdns_upstream_*, rsdns_upstream_pool_*
-metrics:
-  bind: "0.0.0.0:9153"
-  path: /metrics
+#   rsdns_rules_*, rsdns_upstream_*, rsdns_upstream_pool_*,
+#   rsdns_jemalloc_* (under the jemalloc feature)
+ui:
+  bind: "127.0.0.1:8153"

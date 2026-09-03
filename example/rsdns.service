@@ -1,7 +1,7 @@
 # Example systemd unit for rsdns.
 #
 # Type=notify: systemd waits until rsdns sends READY=1 over $NOTIFY_SOCKET
-# (after all UDP/TCP listeners and the metrics endpoint are bound), then
+# (after all UDP/TCP listeners and the ui endpoint are bound), then
 # marks the service active.  Without systemd (no $NOTIFY_SOCKET) rsdns runs
 # as usual and the notification is skipped.
 #
