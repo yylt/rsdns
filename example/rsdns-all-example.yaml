@@ -157,6 +157,18 @@ rules:
       max_answers: 5   # cap returned answers (default 5; 0 = no limit)
       edns: "203.0.113.0/24"   # 固定 EDNS Client Subnet (RFC 7871)，该规则的查询都通告此网段
 
+  # Forward with Cloudflare ECH completion (HTTPS queries): when an HTTPS
+  # answer's ipv4hint falls inside the built-in Cloudflare IPv4 ranges but
+  # carries no `ech` SvcParam, that record is replaced by an HTTPS template
+  # fetched from cloudflare_ech (same upstream, cached by TTL).
+  #   cloudflare_ech: 字面域名，通常用 crypto.cloudflare.com
+  - match: "cloudflare-cdn.example.com"
+    qtype: HTTPS
+    action:
+      type: forward
+      upstream: default
+      cloudflare_ech: "crypto.cloudflare.com"
+
   # Forward a CDN group's subdomains (inline suffix match:
   # cdn.cloudflare.com and below)
   - match: "cdn.cloudflare.com"

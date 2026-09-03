@@ -254,6 +254,14 @@ pub enum RuleActionConfig {
         /// carries the ECS option.  Omitted → no EDNS option is added.
         #[serde(default)]
         edns: Option<String>,
+        /// Cloudflare ECH bootstrap domain (literal, e.g.
+        /// `crypto.cloudflare.com`).  When a HTTPS answer of this rule
+        /// carries an `ipv4hint` inside the built-in Cloudflare IPv4 ranges
+        /// but no `ech` SvcParam, the record is replaced by an HTTPS
+        /// template fetched from this domain (same upstream, cached by TTL).
+        /// Omitted → the feature is disabled for this rule.
+        #[serde(default)]
+        cloudflare_ech: Option<String>,
     },
     /// Rewrite the query with a synthesized IPv4 A answer (no upstream
     /// query).  `target` is a dotted-quad IPv4 (`10.10.0.0`) or a
@@ -510,6 +518,32 @@ rules:
         }
         match &configs[1].action {
             RuleActionConfig::Forward { edns, .. } => assert!(edns.is_none(), "default must be None"),
+            other => panic!("expected Forward, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_forward_cloudflare_ech_parse() {
+        let yaml = r#"
+rules:
+  - match: ""
+    action: { type: forward, upstream: default, cloudflare_ech: "crypto.cloudflare.com" }
+  - match: ""
+    action: { type: forward, upstream: default }
+"#;
+        let config = Config::from_yaml_str(yaml).expect("parse failed");
+        let raw = config.plugin_sections.get("rules").cloned().unwrap();
+        let configs: Vec<RuleConfig> = serde_yaml::from_value(raw).unwrap();
+        match &configs[0].action {
+            RuleActionConfig::Forward { cloudflare_ech, .. } => {
+                assert_eq!(cloudflare_ech.as_deref(), Some("crypto.cloudflare.com"))
+            }
+            other => panic!("expected Forward, got {other:?}"),
+        }
+        match &configs[1].action {
+            RuleActionConfig::Forward { cloudflare_ech, .. } => {
+                assert!(cloudflare_ech.is_none(), "default must be None")
+            }
             other => panic!("expected Forward, got {other:?}"),
         }
     }

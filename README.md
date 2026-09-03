@@ -20,7 +20,7 @@
   - DoH3（`h3://`）
   - DoQ（`quic://`）
 - **查询管道**：`hosts → groups → cache → rules`，未命中规则返回 NXDOMAIN/SERVFAIL
-- **规则**：`block`（NXDomain / 毒化 IP）、`cname`（重写 + 递归解析）、`forward`（转发到上游池，可选 TTL 覆盖 / resolve_cname）、`rewrite`（合成 A 记录）
+- **规则**：`block`（NXDomain / 毒化 IP）、`cname`（重写 + 递归解析）、`forward`（转发到上游池，可选 TTL 覆盖 / resolve_cname / cloudflare_ech 补全）、`rewrite`（合成 A 记录）
 - **缓存**：LRU，可配置容量、TTL 范围；moka 按条目 TTL 自动过期（无 stale 服务）
 - **连接池**：自适应地址轮换、故障冷却、地址族偏好
 - **文件源**：`groups` / `hosts` 支持 `file://` 源，`notify` 监听文件变化自动重载
