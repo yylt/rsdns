@@ -138,6 +138,7 @@ const MODULES = [
     items: [
       { name: "rsdns_logs_queries_total", label: "查询总数", fmt: fmtCount, desc: "所有协议的查询" },
       { name: "rsdns_rules_matched_total", label: "规则命中", fmt: fmtCount, desc: "各动作命中次数", perLabel: "action" },
+      { name: "rsdns_upstream_query_total", label: "上游命中", fmt: fmtCount, desc: "转发到各上游池的查询次数", perLabel: "upstream" },
     ],
   },
   {
@@ -204,6 +205,20 @@ function render(series) {
     cards.className = "cards";
     for (const item of mod.items) {
       let matched = series.filter((s) => seriesMatch(s, item));
+      // perLabel 指标：同一 label 值（如同一上游池的不同 proto）合并求和，
+      // 否则一张卡片会出现 "std 5 · std 3" 的重复项。
+      if (item.perLabel) {
+        const byLabel = new Map();
+        for (const s of matched) {
+          const key = s.labels[item.perLabel] || "?";
+          byLabel.set(key, (byLabel.get(key) || 0) + s.value);
+        }
+        matched = [...byLabel.entries()].map(([k, v]) => ({
+          name: item.name,
+          labels: { [item.perLabel]: k },
+          value: v,
+        }));
+      }
       // 无 label 的指标：聚合所有 series（如 total 类带不同 label 时求和展示）
       if (!item.match && !item.perGroup && !item.perLabel && matched.length > 1) {
         matched = [{ name: item.name, labels: {}, value: matched.reduce((a, s) => a + s.value, 0) }];
