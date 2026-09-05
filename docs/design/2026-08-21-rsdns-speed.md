@@ -1,5 +1,9 @@
 # rsdns speed 插件：按测速结果对 A/AAAA 记录排序
 
+> 2026-09-04 | **已归档**：独立 `speed` 插件已并入 `balance` 插件的 `mode: speed`
+> （见 `docs/design/2026-09-04-rsdns-balance.md` v2）。本文保留历史设计，不再实现。
+
+
 > 2026-08-21 | 提案 v2
 >
 > v2 变更（按评审意见）：

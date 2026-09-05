@@ -117,7 +117,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let cache = plugins::cache::init(&config, &metrics);
     let upstreams = upstream::init(&config, &metrics).await?;
     let rules = plugins::rules::init(&config, &metrics, upstreams);
-    let speed = plugins::speed::init(&config);
+    let balance = plugins::balance::init(&config);
 
     let pipeline = Pipeline {
         logs,
@@ -125,7 +125,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         groups,
         cache,
         rules,
-        speed,
+        balance,
     };
     let server = Arc::new(DnsServer::new(pipeline));
 

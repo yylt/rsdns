@@ -61,9 +61,11 @@ pub struct QueryContext {
     pub skip_log: bool,
     /// When set, the `cache` stage skips both lookup and write-back.
     pub skip_cache: bool,
-    /// When set, the `speed` stage skips latency-ordered answer sorting
-    /// (set by the groups stage for groups with `skip_speed: true`).
-    pub skip_speed: bool,
+    /// When set, the `balance` stage skips its whole post-pass (`prefers`
+    /// reordering, `mode` processing and `max_answers` truncation; set by
+    /// the groups stage for groups with `skip_balance: true` and by the
+    /// cache stage on a fresh hit).
+    pub skip_balance: bool,
 
     // State filled in by stages along the pipeline.
     /// Set by a responding stage (hosts / cache / rules).
@@ -103,7 +105,7 @@ impl QueryContext {
             size,
             skip_log: false,
             skip_cache: false,
-            skip_speed: false,
+            skip_balance: false,
             response: None,
             action: String::new(),
             group: None,

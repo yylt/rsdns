@@ -266,8 +266,9 @@ impl Cache {
 
         match self.cache.get_cached(&ctx.key).await {
             CacheResult::Fresh(entry) => {
-                // 缓存命中：答案已在写回前按测速排序，跳过 speed 阶段重复探测。
-                ctx.skip_speed = true;
+                // 缓存命中：顺序在写回时已被 balance 排定，跳过 balance
+                // 阶段重复处理（缓存同一 TTL 内各客户端拿到一致顺序）。
+                ctx.skip_balance = true;
                 let action = entry.action_name();
                 match build_response_from_cache(&ctx.msg, &entry, self.cache.keep_ttl) {
                     Ok(resp) => {

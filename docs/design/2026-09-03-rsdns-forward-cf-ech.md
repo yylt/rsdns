@@ -2,6 +2,8 @@
 
 - 日期: 2026-09-03
 - 状态: 已实现
+- 2026-09-04 注记：文中 `forward` 的 `max_answers` 截断已移除并上收为
+  `balance.max_answers`（见 `2026-09-04-rsdns-balance.md`）。
 
 ## 1. 动机
 

@@ -8,8 +8,8 @@
 //!   named upstream, `Respond`;
 //! - `forward` → **terminal**: query the named upstream directly via the
 //!   assembled [`crate::upstream::Upstreams`] and fill `ctx.response`,
-//!   `Respond` (there is no separate upstream pipeline stage); `max_answers`
-//!   caps the number of answer records returned (default 5, `0` = no limit);
+//!   `Respond` (there is no separate upstream pipeline stage); answer
+//!   capping / reordering is handled by the `balance` stage after rules;
 //!   `resolve_cname: true` resolves the target when the response's first
 //!   answer is a CNAME (only the last CNAME of a pure CNAME chain is
 //!   resolved; a chain the response already completes with A/AAAA is
@@ -292,7 +292,6 @@ pub enum RuleAction {
     Forward {
         upstream: String,
         ttl: Option<u32>,
-        max_answers: usize,
         deny_qtypes: Vec<RecordType>,
         resolve_cname: bool,
         /// Fixed EDNS Client Subnet advertised to the upstream (RFC 7871).
@@ -311,7 +310,6 @@ pub enum RuleAction {
 #[derive(Clone, Copy)]
 struct ForwardOpts<'a> {
     ttl: Option<u32>,
-    max_answers: usize,
     resolve_cname: bool,
     subnet: Option<ClientSubnet>,
     cf_ech: Option<&'a CfEch>,
@@ -513,13 +511,6 @@ fn build_rewrite_response(
     Ok(response)
 }
 
-/// 截断应答中的 answer 记录（`max` 为 0 时不过限）。
-fn truncate_answers(msg: &mut Message, max: usize) {
-    if max > 0 && msg.answers.len() > max {
-        msg.answers.truncate(max);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Stage
 // ---------------------------------------------------------------------------
@@ -593,7 +584,6 @@ pub fn init(config: &Config, registry: &MetricsRegistry, upstreams: Arc<crate::u
             RuleActionConfig::Forward {
                 upstream,
                 ttl,
-                max_answers,
                 deny_qtypes,
                 resolve_cname,
                 edns,
@@ -601,7 +591,6 @@ pub fn init(config: &Config, registry: &MetricsRegistry, upstreams: Arc<crate::u
             } => RuleAction::Forward {
                 upstream: upstream.clone(),
                 ttl: *ttl,
-                max_answers: max_answers.unwrap_or(5),
                 deny_qtypes: deny_qtypes.iter().map(|qt| parse_qtype(qt)).collect(),
                 resolve_cname: *resolve_cname,
                 subnet: parse_rule_edns(edns.as_deref()),
@@ -757,7 +746,6 @@ impl Rules {
             RuleAction::Forward {
                 upstream,
                 ttl,
-                max_answers,
                 deny_qtypes,
                 resolve_cname,
                 subnet,
@@ -788,7 +776,6 @@ impl Rules {
                     }
                     let opts = ForwardOpts {
                         ttl: *ttl,
-                        max_answers: *max_answers,
                         resolve_cname: *resolve_cname,
                         subnet: *subnet,
                         cf_ech: cf_ech.as_ref(),
@@ -825,11 +812,11 @@ impl Rules {
         }
     }
 
-    /// 查询 `upstream` 并写入 `ctx.response`；应用 TTL 覆盖与 answer 数目
-    /// 截断（`max_answers`，`0` = 不限）。返回 `Ok` 表示拿到了上游响应。
+    /// 查询 `upstream` 并写入 `ctx.response`；应用 TTL 覆盖。返回 `Ok`
+    /// 表示拿到了上游响应。
     /// 当 `resolve_cname` 开启且上游应答首条为 CNAME 时，先按 §`resolve_cnames`
     /// 主动解析 target；随后若 `cf_ech` 启用，对落在 CF 网段且缺 `ech` 的
-    /// HTTPS answer 做 ECH 补全（都在 TTL 覆盖与截断之前）。
+    /// HTTPS answer 做 ECH 补全（都在 TTL 覆盖之前）。
     async fn forward_query(&self, ctx: &mut QueryContext, upstream: &str, opts: ForwardOpts<'_>) -> io::Result<()> {
         let mut msg = ctx.msg.clone();
         if let Some(subnet) = opts.subnet {
@@ -853,7 +840,6 @@ impl Rules {
         if let Some(ttl) = opts.ttl {
             rewrite_ttl_in_response(&mut resp, ttl);
         }
-        truncate_answers(&mut resp, opts.max_answers);
         ctx.response = Some(resp);
         Ok(())
     }
@@ -1449,36 +1435,6 @@ mod tests {
         assert!(build_rewrite_response(&msg, "node.example.com", "1.2.3.999", &[], 300).is_err());
         assert!(build_rewrite_response(&msg, "node.example.com", "{1}.2.3.4", &[], 300).is_err());
         assert!(build_rewrite_response(&msg, "node.example.com", "{1}.2.3.4", &["x".to_string()], 300).is_err());
-    }
-
-    #[test]
-    fn test_truncate_answers() {
-        let mut msg = make_query_msg("example.com", RecordType::A).unwrap();
-        for i in 1..=8u8 {
-            let rec = Record::from_rdata(
-                Name::from_utf8("example.com").unwrap(),
-                300,
-                RData::A(A(Ipv4Addr::new(10, 0, 0, i))),
-            );
-            msg.answers.push(rec);
-        }
-        // 默认语义：超过 5 截到 5
-        truncate_answers(&mut msg, 5);
-        assert_eq!(msg.answers.len(), 5);
-        // 不足上限不动
-        truncate_answers(&mut msg, 100);
-        assert_eq!(msg.answers.len(), 5);
-        // 0 = 不限
-        let mut msg2 = make_query_msg("example.com", RecordType::A).unwrap();
-        for i in 1..=8u8 {
-            msg2.answers.push(Record::from_rdata(
-                Name::from_utf8("example.com").unwrap(),
-                300,
-                RData::A(A(Ipv4Addr::new(10, 0, 0, i))),
-            ));
-        }
-        truncate_answers(&mut msg2, 0);
-        assert_eq!(msg2.answers.len(), 8);
     }
 
     #[test]

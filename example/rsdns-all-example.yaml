@@ -48,7 +48,8 @@ groups:
     domains:
       - cloudflare.com
     skip_cache: true
-    # skip_speed: true   # also skip the speed plugin's latency sorting
+    # skip_balance: true   # also skip the balance stage's whole post-pass
+    #                      # (prefers / mode / max_answers)
 
 # Upstream pools: named groups of servers.  mode: serial (default) |
 # parallel | random | round_robin.
@@ -154,7 +155,6 @@ rules:
       type: forward
       upstream: overseas
       ttl: 60       # rewrite response TTL to 60s
-      max_answers: 5   # cap returned answers (default 5; 0 = no limit)
       edns: "203.0.113.0/24"   # 固定 EDNS Client Subnet (RFC 7871)，该规则的查询都通告此网段
 
   # Forward with Cloudflare ECH completion (HTTPS queries): when an HTTPS
@@ -211,20 +211,36 @@ log:
   # directory: '/var/log/rsdns'           # bare path → 5m / 5 files
   # directory: '/var/log/rsdns:2m:3'      # explicit rotation settings
 
-# Speed plugin (optional): latency-orders A/AAAA answers by TCP connect RTT.
-# Disabled by default — set enable: true to turn it on.
-#   type:          probe type, "syn" (default)
-#   port:          probe destination port, 443 (default)
-#   family:        record family to sort: ANY (default) / A / AAAA; a query
-#                  type only participates when it matches (A matches A/ANY,
-#                  AAAA matches AAAA/ANY)
-#   timeout:       per-IP probe timeout (bare number = seconds, or "500ms")
-speed:
-  enable: false
-  type: syn
-  port: 443
-  family: ANY
-  timeout: 1s
+# Balance plugin (optional): reorders A/AAAA answers before they are
+# returned, and optionally caps the total answer count.  Absent → no
+# reordering, no truncation (upstream answers are returned as-is).
+#   mode:        post-pass applied when a family's records are all equally
+#                ranked (no CIDR hit, or all in one CIDR):
+#                  none        (default) nothing beyond prefers/max_answers
+#                  round_robin rotate from a fresh random offset per query —
+#                              stateless, no shared counter
+#                  speed       latency-order by TCP-connect RTT
+#                Once `prefers` produces differing ranks the stable
+#                prefer-sort wins and mode does not run.
+#   prefers:     flat CIDR list, order = priority: an answer IP in an earlier
+#                CIDR is sorted ahead of one in a later CIDR; unmatched IPs
+#                keep their order at the end.  All clients see the same order.
+#   max_answers: optional whole-answer cap after reordering (0 or absent =
+#                no limit).  Formerly `forward.max_answers`, now global.
+#   speed:       parameters for mode: speed — type "syn" (default), port 443,
+#                timeout 1s (bare seconds or "500ms").
+# Cache hits and groups with `skip_balance: true` skip the whole post-pass.
+balance:
+  mode: round_robin
+  max_answers: 5
+  prefers:
+    - "223.5.5.0/24"       # e.g. a domestic/backbone CIDR to prefer
+    - "114.114.0.0/16"
+    # - "2400:3200::/32"    # IPv6 CIDRs only match AAAA records
+  # speed:                  # only read when mode: speed
+  #   type: syn
+  #   port: 443
+  #   timeout: 1s
 
 # Built-in web UI (optional).  Serves two paths on one listener:
 #   /         mobile-friendly HTML dashboard (memory / cache / query metrics,
