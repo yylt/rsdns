@@ -77,7 +77,7 @@ impl GroupState {
 /// 解析一行域名数据：整行注释/空行忽略；剥 `*.` 前缀。
 fn parse_domain_lines(content: &str, out: &mut Vec<String>) {
     for line in content.lines() {
-        let line = line.trim();
+        let line = line.split_once('#').map_or(line, |(content, _)| content).trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
@@ -288,7 +288,7 @@ mod tests {
     fn test_parse_domain_lines_handles_comments_and_wildcards() {
         let mut out = Vec::new();
         parse_domain_lines(
-            "# comment\n\ndoubleclick.net\n*.googlesyndication.com\n  spaced.example.com  \n",
+            "# comment\n\ndoubleclick.net # ad network\n*.googlesyndication.com\n  spaced.example.com  # trailing comment\n",
             &mut out,
         );
         assert_eq!(

@@ -117,7 +117,7 @@ impl Default for HostsTrieBuilder {
 /// 解析一行 hosts 条目。返回 `true` 表示该行已被消费（空行 / 注释 / IP 行）；
 /// 返回 `false` 表示不是 IP 行，应交给 [`parse_alias_line`] 尝试别名解析。
 fn parse_hosts_line(builder: &mut HostsTrieBuilder, line: &str) -> bool {
-    let line = line.trim();
+    let line = line.split_once('#').map_or(line, |(content, _)| content).trim();
     if line.is_empty() || line.starts_with('#') {
         return true;
     }
@@ -140,7 +140,7 @@ fn parse_hosts_line(builder: &mut HostsTrieBuilder, line: &str) -> bool {
 /// 跳过（IP 行交给 [`parse_hosts_line`]；纯数字串会与 IP 索引 tag 的 usize
 /// 解析歧义）。自引用别名忽略。
 fn parse_alias_line(builder: &mut HostsTrieBuilder, line: &str) {
-    let line = line.trim();
+    let line = line.split_once('#').map_or(line, |(content, _)| content).trim();
     if line.is_empty() || line.starts_with('#') {
         return;
     }
@@ -355,6 +355,12 @@ mod tests {
         assert!(!parse_hosts_line(&mut b, "edge.com cdn.com"));
         // 单 token：未消费
         assert!(!parse_hosts_line(&mut b, "a.com"));
+
+        let mut b = HostsTrieBuilder::new();
+        assert!(parse_hosts_line(&mut b, "0.0.0.0 ad.example # do not parse these words"));
+        let trie = b.build();
+        assert!(matches!(trie.lookup("ad.example"), Lookup::Ips(_)));
+        assert_eq!(trie.lookup("words"), Lookup::Miss);
     }
 
     #[test]
