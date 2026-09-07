@@ -613,40 +613,51 @@ async fn bootstrap_resolve_all(
     use crate::plugins::util::make_query_msg;
     use hickory_proto::rr::{RData, RecordType};
 
+    /// Resolves `host` via every bootstrap client, for both A and AAAA,
+    /// **concurrently**; the collected A + AAAA addresses (all clients, all
+    /// qtypes) are the resolved address set.
     async fn resolve_host_all(
         bootstrap_clients: &[UpstreamClient],
         host: &str,
         port: u16,
         prefer_family: PreferFamily,
     ) -> Vec<SocketAddr> {
+        // Fan out one query per (bootstrap client × qtype) so the wall time
+        // is a single DNS round-trip instead of N×M serial queries.
+        let mut futs: FuturesUnordered<_> = bootstrap_clients
+            .iter()
+            .flat_map(|client| {
+                [RecordType::A, RecordType::AAAA].into_iter().filter_map(move |qtype| {
+                    match prefer_family {
+                        PreferFamily::Ipv4 if qtype != RecordType::A => return None,
+                        PreferFamily::Ipv6 if qtype != RecordType::AAAA => return None,
+                        _ => {}
+                    }
+                    let msg = make_query_msg(host, qtype).ok()?;
+                    Some((client, qtype, msg))
+                })
+            })
+            .map(|(client, qtype, msg)| async move { (qtype, client.query(&msg).await) })
+            .collect();
+
         let mut addrs = Vec::new();
-
-        for qtype in [RecordType::A, RecordType::AAAA] {
-            match prefer_family {
-                PreferFamily::Ipv4 if qtype != RecordType::A => continue,
-                PreferFamily::Ipv6 if qtype != RecordType::AAAA => continue,
-                _ => {}
-            }
-            let Ok(msg) = make_query_msg(host, qtype) else { continue };
-
-            for client in bootstrap_clients {
-                match client.query(&msg).await {
-                    Ok(resp) => {
-                        for answer in &resp.answers {
-                            match answer.data {
-                                RData::A(ip) => {
-                                    addrs.push(SocketAddr::new(IpAddr::V4(ip.0), port));
-                                }
-                                RData::AAAA(ip) => {
-                                    addrs.push(SocketAddr::new(IpAddr::V6(ip.0), port));
-                                }
-                                _ => {}
+        while let Some((qtype, result)) = futs.next().await {
+            match result {
+                Ok(resp) => {
+                    for answer in &resp.answers {
+                        match (qtype, &answer.data) {
+                            (RecordType::A, RData::A(ip)) => {
+                                addrs.push(SocketAddr::new(IpAddr::V4(ip.0), port));
                             }
+                            (RecordType::AAAA, RData::AAAA(ip)) => {
+                                addrs.push(SocketAddr::new(IpAddr::V6(ip.0), port));
+                            }
+                            _ => {}
                         }
                     }
-                    Err(e) => {
-                        warn!("Bootstrap query failed for {} ({}): {}", host, qtype, e);
-                    }
+                }
+                Err(e) => {
+                    warn!("Bootstrap query failed for {} ({}): {}", host, qtype, e);
                 }
             }
         }
@@ -655,20 +666,26 @@ async fn bootstrap_resolve_all(
         addrs
     }
 
-    let mut results = Vec::new();
-    for (idx, cfg) in targets {
-        let (host_str, port, prefer_family) = match cfg {
+    // Resolve all dynamic upstreams concurrently; each target is independent.
+    let results: Vec<_> = targets
+        .iter()
+        .filter_map(|(idx, cfg)| match cfg {
             UpstreamConfig::NeedResolve {
                 server_name,
                 port,
                 prefer_family,
                 ..
-            } => (server_name.clone(), *port, *prefer_family),
-            _ => continue,
-        };
-        let addrs = resolve_host_all(bootstrap_clients, &host_str, port, prefer_family).await;
-        results.push((*idx, addrs));
-    }
+            } => Some((*idx, server_name.clone(), *port, *prefer_family)),
+            _ => None,
+        })
+        .map(|(idx, host_str, port, prefer_family)| async move {
+            let addrs = resolve_host_all(bootstrap_clients, &host_str, port, prefer_family).await;
+            (idx, addrs)
+        })
+        .collect::<FuturesUnordered<_>>()
+        .collect()
+        .await;
+
     results
 }
 

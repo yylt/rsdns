@@ -64,10 +64,11 @@ pub struct GroupConfig {
     /// (both lookup and write-back).
     #[serde(default)]
     pub skip_cache: bool,
-    /// When a queried name belongs to this group, skip the speed plugin's
-    /// latency-ordered sorting of A/AAAA answers.
+    /// When a queried name belongs to this group, skip the balance stage's
+    /// whole post-pass: `prefers` reordering, `mode` processing
+    /// (round_robin / speed) and `max_answers` truncation.
     #[serde(default)]
-    pub skip_speed: bool,
+    pub skip_balance: bool,
 }
 
 impl Config {
@@ -101,28 +102,82 @@ pub struct CacheConfig {
     pub keep_ttl: Option<bool>,
 }
 
-/// Speed plugin configuration (top-level `speed:` section).
+/// Balance plugin configuration (top-level `balance:` section).
 ///
-/// Latency-measures A/AAAA answers and sorts them by RTT.  Disabled by
-/// default; see the design doc `docs/design/2026-08-21-rsdns-speed.md`.
+/// Reorders A/AAAA answers before they are returned: records whose IP falls
+/// in a `prefers` CIDR are moved to the front (list order = priority), then
+/// an optional `mode` post-pass runs, and `max_answers` caps the total
+/// answer count.  Disabled entirely when the `balance:` section is absent;
+/// see the design doc `docs/design/2026-09-04-rsdns-balance.md`.
 #[derive(Debug, Clone, Deserialize)]
-pub struct SpeedConfig {
-    /// Master switch; `false` (default) disables latency sorting entirely.
+pub struct BalanceConfig {
+    /// Post-pass mode: `none` (default; only `prefers` + `max_answers` run),
+    /// `round_robin`, or `speed` (latency-order by TCP-connect RTT).
+    #[serde(default = "default_balance_mode")]
+    pub mode: String,
+    /// Flat CIDR list whose order is priority: an answer IP matching an
+    /// earlier CIDR is sorted ahead of one matching a later CIDR; IPs
+    /// matching no CIDR keep their relative order at the end.
     #[serde(default)]
-    pub enable: bool,
+    pub prefers: Vec<String>,
+    /// Cap the number of answer records returned (applied after reordering,
+    /// on the whole answer list; `0` or absent = no limit).
+    #[serde(default)]
+    pub max_answers: Option<usize>,
+    /// Parameters for `mode: speed` (read only in that mode).
+    #[serde(default)]
+    pub speed: Option<BalanceSpeedConfig>,
+}
+
+/// Parsed `balance.mode`; only `round_robin` / `speed` carry behaviour
+/// beyond the default `none`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BalanceMode {
+    /// No post-pass beyond `prefers` / `max_answers`.
+    None,
+    RoundRobin,
+    Speed,
+}
+
+impl BalanceMode {
+    /// Parses a `mode` string; unknown values fall back to [`BalanceMode::None`].
+    pub fn parse(s: &str) -> BalanceMode {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "round_robin" | "round-robin" => BalanceMode::RoundRobin,
+            "speed" => BalanceMode::Speed,
+            _ => BalanceMode::None,
+        }
+    }
+}
+
+fn default_balance_mode() -> String {
+    "none".into()
+}
+
+/// Parameters for the `balance` stage's `speed` mode (TCP-connect RTT
+/// latency sorting; `mode: speed` only).
+#[derive(Debug, Clone, Deserialize)]
+pub struct BalanceSpeedConfig {
     /// Probe type; currently only `"syn"` (default).
     #[serde(default = "default_speed_type")]
     pub r#type: String,
     /// Probe destination port (default 443).
     #[serde(default = "default_speed_port")]
     pub port: u16,
-    /// Address family to sort: `"ANY"` (default) / `"A"` / `"AAAA"`.
-    #[serde(default = "default_speed_family")]
-    pub family: String,
     /// Per-IP probe timeout: bare number = seconds, optional `ms`/`s`/`m`
     /// suffix (default `"1s"`).
     #[serde(default = "default_speed_timeout")]
     pub timeout: String,
+}
+
+impl Default for BalanceSpeedConfig {
+    fn default() -> Self {
+        Self {
+            r#type: default_speed_type(),
+            port: default_speed_port(),
+            timeout: default_speed_timeout(),
+        }
+    }
 }
 
 fn default_speed_type() -> String {
@@ -133,28 +188,12 @@ fn default_speed_port() -> u16 {
     443
 }
 
-fn default_speed_family() -> String {
-    "ANY".into()
-}
-
 fn default_speed_timeout() -> String {
     "1s".into()
 }
 
-impl Default for SpeedConfig {
-    fn default() -> Self {
-        Self {
-            enable: false,
-            r#type: default_speed_type(),
-            port: default_speed_port(),
-            family: default_speed_family(),
-            timeout: default_speed_timeout(),
-        }
-    }
-}
-
 /// Parses a duration string (`"500ms"`, `"2s"`, `"1m"`, bare seconds) into
-/// [`std::time::Duration`].  Used by the speed plugin's `timeout`.
+/// [`std::time::Duration`].  Used by the balance speed mode's `timeout`.
 pub fn parse_duration(s: &str) -> Option<std::time::Duration> {
     let s = s.trim();
     if s.is_empty() {
@@ -223,6 +262,7 @@ pub enum RuleActionConfig {
     ///
     /// Cache policy is no longer expressed here — it lives on the groups
     /// plugin (`skip_cache`) and the chain context (`ctx.skip_cache`).
+    /// Answer capping / reordering is handled by the `balance` stage.
     #[serde(rename = "forward")]
     Forward {
         /// `upstream` pool name (must exist in `[upstreams]`).
@@ -230,11 +270,6 @@ pub enum RuleActionConfig {
         upstream: String,
         /// If set, rewrite the response TTL to this value.
         ttl: Option<u32>,
-        /// Cap the number of answer records returned to the client
-        /// (default 5; `0` = no limit).  Truncation happens on the final
-        /// response and the cached copy.
-        #[serde(default)]
-        max_answers: Option<usize>,
         /// Refuse these query types before forwarding upstream (e.g. ["A", "AAAA"]).
         #[serde(default)]
         deny_qtypes: Vec<String>,

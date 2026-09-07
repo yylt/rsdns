@@ -1,6 +1,9 @@
 # rsdns inbound DoT / DoH / DoH3 监听能力
 
 > 2026-09-01 | 提案
+>
+> 2026-09-04 | 注记：管线中的独立 `speed` 插件已并入 `balance.mode: speed`
+> （见 `2026-09-04-rsdns-balance.md`），后置处理由 balance 承担。
 
 ## 1. 动机
 

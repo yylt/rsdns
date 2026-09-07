@@ -1,5 +1,9 @@
 # rsdns `forward` 动作新增 `resolve_cname` 配置
 
+> 2026-09-04 | 注记：文中 `forward` 的 `max_answers` 截断已移除并上收为
+> `balance.max_answers`（见 `2026-09-04-rsdns-balance.md`）；resolve_cname 链
+> 处理仍在 rules 的 `forward_query` 内完成，截断在 balance 后置阶段进行。
+
 ## 1. 背景
 
 当前 `forward` 动作（`src/plugins/rules.rs`）只做一件事：把查询发给

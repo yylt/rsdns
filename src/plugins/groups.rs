@@ -37,7 +37,7 @@ struct GroupTrie {
 struct GroupState {
     name: String,
     skip_cache: bool,
-    skip_speed: bool,
+    skip_balance: bool,
     inline: Vec<String>,
     files: Vec<GroupFile>,
     /// Active trie (atomically replaced on reload).
@@ -65,7 +65,7 @@ impl GroupState {
         Self {
             name: cfg.name.clone(),
             skip_cache: cfg.skip_cache,
-            skip_speed: cfg.skip_speed,
+            skip_balance: cfg.skip_balance,
             inline,
             files,
             current: RwLock::new(initial),
@@ -77,7 +77,7 @@ impl GroupState {
 /// 解析一行域名数据：整行注释/空行忽略；剥 `*.` 前缀。
 fn parse_domain_lines(content: &str, out: &mut Vec<String>) {
     for line in content.lines() {
-        let line = line.trim();
+        let line = line.split_once('#').map_or(line, |(content, _)| content).trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
@@ -263,8 +263,8 @@ impl Groups {
                 if state.skip_cache {
                     ctx.skip_cache = true;
                 }
-                if state.skip_speed {
-                    ctx.skip_speed = true;
+                if state.skip_balance {
+                    ctx.skip_balance = true;
                 }
                 if let Some(m) = self.metrics.get() {
                     m.hit_total.with_label_values(&[&state.name]).inc();
@@ -288,7 +288,7 @@ mod tests {
     fn test_parse_domain_lines_handles_comments_and_wildcards() {
         let mut out = Vec::new();
         parse_domain_lines(
-            "# comment\n\ndoubleclick.net\n*.googlesyndication.com\n  spaced.example.com  \n",
+            "# comment\n\ndoubleclick.net # ad network\n*.googlesyndication.com\n  spaced.example.com  # trailing comment\n",
             &mut out,
         );
         assert_eq!(
@@ -320,7 +320,7 @@ mod tests {
                 "inline.example".into(),
             ],
             skip_cache: true,
-            skip_speed: true,
+            skip_balance: true,
         };
         let state = GroupState::build_from(&cfg);
         assert_eq!(state.inline, vec!["inline.example".to_string()]);
@@ -328,6 +328,6 @@ mod tests {
         assert_eq!(state.files[0], GroupFile(PathBuf::from("/tmp/a.txt")));
         assert_eq!(state.files[1], GroupFile(PathBuf::from("/tmp/b.txt")));
         assert!(state.skip_cache);
-        assert!(state.skip_speed);
+        assert!(state.skip_balance);
     }
 }

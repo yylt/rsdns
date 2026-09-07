@@ -13,6 +13,7 @@
 //! `groups[]` array; the upstream provider lives in `crate::upstream`
 //! and is injected into the server (not a pipeline stage).
 
+pub mod balance;
 pub mod cache;
 pub mod groups;
 pub mod hosts;
@@ -20,6 +21,5 @@ pub mod hosts;
 pub mod jemalloc;
 pub mod logs;
 pub mod rules;
-pub mod speed;
 pub mod ui;
 pub mod util;

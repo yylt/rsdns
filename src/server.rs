@@ -32,7 +32,7 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::plugins::cache::CacheKey;
 use crate::plugins::util::build_servfail;
-use crate::plugins::{cache, groups, hosts, logs, rules, speed};
+use crate::plugins::{balance, cache, groups, hosts, logs, rules};
 use crate::query::{QueryContext, Step};
 
 const MAX_DNS_SIZE: usize = 4096;
@@ -49,7 +49,7 @@ pub struct Pipeline {
     pub groups: groups::Groups,
     pub cache: cache::Cache,
     pub rules: rules::Rules,
-    pub speed: speed::Speed,
+    pub balance: balance::Balance,
 }
 
 pub struct DnsServer {
@@ -478,8 +478,9 @@ impl DnsServer {
             ctx.response = Some(build_servfail(&ctx.msg));
         }
 
-        // speed 阶段：对 A/AAAA 应答按测速 RTT 排序（后置 pass，不短路）。
-        self.pipeline.speed.handle(&mut ctx).await;
+        // balance 阶段：按 prefers / mode 重排 A/AAAA 并可选截断（后置
+        // pass，不短路）；缓存命中与 skip_balance 组在阶段内直接放行。
+        self.pipeline.balance.handle(&mut ctx).await;
 
         // hosts 别名无 IP 分支：解析目标被改写为原域名，最终应答按客户端
         // 查询名（original_name）呈现 —— 恢复 question 与 answer owner。
@@ -614,7 +615,7 @@ mod tests {
     use crate::common::tls::{generate_self_signed, load_server_config};
     use crate::config::Config;
     use crate::plugins::util::make_query_msg;
-    use crate::plugins::{cache, groups, hosts, logs, rules, speed};
+    use crate::plugins::{balance, cache, groups, hosts, logs, rules};
     use crate::upstream;
     use crate::upstream::conn::exchange_from;
     use hickory_net::runtime::TokioRuntimeProvider;
@@ -643,14 +644,14 @@ mod tests {
         let cache = cache::init(&config, &metrics);
         let upstreams = upstream::init(&config, &metrics).await.unwrap();
         let rules = rules::init(&config, &metrics, upstreams);
-        let speed = speed::init(&config);
+        let balance = balance::init(&config);
         Arc::new(DnsServer::new(Pipeline {
             logs,
             hosts,
             groups,
             cache,
             rules,
-            speed,
+            balance,
         }))
     }
 

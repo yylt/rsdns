@@ -1,5 +1,8 @@
 # rsdns `hosts` 插件支持 `domain domain,…` 代替域名（别名）格式
 
+> 2026-09-04 | 注记：文中"管线 … → rules → speed"描述中的独立 `speed` 插件已并入
+> `balance.mode: speed`（见 `2026-09-04-rsdns-balance.md`），后置处理由 balance 承担。
+
 ## 1. 背景
 
 当前 `hosts` 插件（`src/plugins/hosts.rs`）只支持 `IP domain [domain...]`
