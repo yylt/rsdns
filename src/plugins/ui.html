@@ -6,15 +6,61 @@
 <title>rsdns 状态</title>
 <style>
   :root {
+    color-scheme: light dark;
     --bg: #f4f6fb;
     --card: #ffffff;
+    --card2: #fafbfe;
+    --card-border: #e5e7eb;
     --text: #1f2937;
     --muted: #6b7280;
+    --shadow: 0 1px 3px rgba(0,0,0,.08);
     --mem: #2563eb;
     --cache: #059669;
     --query: #d97706;
     --group: #7c3aed;
     --radius: 14px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f172a;
+      --card: #1e293b;
+      --card2: #243247;
+      --card-border: #334155;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --shadow: 0 1px 3px rgba(0,0,0,.4);
+      --mem: #60a5fa;
+      --cache: #34d399;
+      --query: #fbbf24;
+      --group: #a78bfa;
+      --radius: 14px;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f172a;
+    --card: #1e293b;
+    --card2: #243247;
+    --card-border: #334155;
+    --text: #e2e8f0;
+    --muted: #94a3b8;
+    --shadow: 0 1px 3px rgba(0,0,0,.4);
+    --mem: #60a5fa;
+    --cache: #34d399;
+    --query: #fbbf24;
+    --group: #a78bfa;
+  }
+  :root[data-theme="light"] {
+    --bg: #f4f6fb;
+    --card: #ffffff;
+    --card2: #fafbfe;
+    --card-border: #e5e7eb;
+    --text: #1f2937;
+    --muted: #6b7280;
+    --shadow: 0 1px 3px rgba(0,0,0,.08);
+    --mem: #2563eb;
+    --cache: #059669;
+    --query: #d97706;
+    --group: #7c3aed;
   }
   * { box-sizing: border-box; }
   body {
@@ -33,6 +79,25 @@
     gap: 6px;
     margin-bottom: 16px;
   }
+  .controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .controls button {
+    border: 1px solid var(--card-border);
+    border-radius: 999px;
+    background: var(--card);
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1;
+    padding: 5px 9px;
+    cursor: pointer;
+  }
+  .controls button:hover { color: var(--text); border-color: var(--muted); }
+  .controls button.active { color: var(--text); border-color: currentColor; }
   #status { font-size: 12px; color: var(--muted); }
   #status.error { color: #dc2626; }
   .modules { display: grid; grid-template-columns: 1fr; gap: 16px; }
@@ -41,7 +106,7 @@
     background: var(--card);
     border-radius: var(--radius);
     padding: 14px 16px;
-    box-shadow: 0 1px 3px rgba(0,0,0,.08);
+    box-shadow: var(--shadow);
   }
   .module h2 {
     font-size: 15px;
@@ -53,8 +118,8 @@
   .cards { display: grid; grid-template-columns: 1fr; gap: 10px; }
   @media (min-width: 720px) { .cards { grid-template-columns: 1fr 1fr; } }
   .card {
-    background: #fafbfe;
-    border: 1px solid #e5e7eb;
+    background: var(--card2);
+    border: 1px solid var(--card-border);
     border-radius: 12px;
     padding: 10px 12px;
     border-left: 4px solid var(--card-color);
@@ -80,10 +145,17 @@
 <body>
 <header>
   <span id="status">加载中…</span>
+  <span class="controls">
+    <button id="theme-btn" title="切换黑夜/白天主题">🌙 黑夜</button>
+    <span id="refresh-label" title="自动刷新间隔">刷新 10s</span>
+    <span class="seg" id="refresh-btns">
+      <button data-sec="10">10s</button><button data-sec="30">30s</button><button data-sec="60">1m</button>
+    </span>
+  </span>
 </header>
 <div class="modules" id="modules"></div>
 <footer>
-  <span>/metrics</span> · 每 3 秒自动刷新
+  <span>/metrics</span> · 自动刷新
 </footer>
 <script>
 "use strict";
@@ -110,12 +182,31 @@ function fmtCount(v) {
   return Math.round(v).toLocaleString("en-US");
 }
 
-// ---- 模块白名单（少而精）：内存 / 缓存 / 查询 / 组 ----
+// ---- 模块（少而精）：查询 / 域名组 / 内存 / 缓存 ----
 // match: 要匹配的 label（缺省表示无 label 的 series）
 const MODULES = [
   {
+    title: "查询",
+    color: "var(--query)",
+    items: [
+      { name: "rsdns_logs_queries_total", label: "查询总数", fmt: fmtCount, desc: "所有协议的查询" },
+      { name: "rsdns_rules_matched_total", label: "规则命中", fmt: fmtCount, desc: "各动作命中次数", perLabel: "action" },
+      { name: "rsdns_upstream_query_total", label: "上游命中", fmt: fmtCount, desc: "转发到各上游池的查询次数", perLabel: "upstream" },
+    ],
+  },
+  {
+    title: "域名组",
+    color: "var(--group)",
+    items: [
+      { name: "rsdns_hosts_entries", label: "hosts 条目", fmt: fmtInt, desc: "已加载的 hosts 条目数" },
+      { name: "rsdns_hosts_hit_total", label: "hosts 匹配", fmt: fmtCount, desc: "hosts 命中次数" },
+      { name: "rsdns_groups_entries", label: "组条目", fmt: fmtInt, desc: "各组域名条目数", perGroup: true },
+      { name: "rsdns_groups_hit_total", label: "组命中", fmt: fmtCount, desc: "各组命中次数", perGroup: true },
+    ],
+  },
+  {
     title: "内存",
-    color: "#2563eb",
+    color: "var(--mem)",
     items: [
       { name: "rsdns_jemalloc_allocated_bytes", label: "已分配", fmt: fmtBytes, desc: "stats.allocated" },
       { name: "rsdns_jemalloc_active_bytes", label: "活跃页", fmt: fmtBytes, desc: "stats.active" },
@@ -125,30 +216,11 @@ const MODULES = [
   },
   {
     title: "缓存",
-    color: "#059669",
+    color: "var(--cache)",
     items: [
       { name: "rsdns_cache_entries", label: "缓存条目", fmt: fmtInt, desc: "当前缓存记录数" },
       { name: "rsdns_cache_lookup_total", match: { result: "fresh" }, label: "命中", fmt: fmtCount, desc: "缓存命中次数" },
       { name: "rsdns_cache_lookup_total", match: { result: "miss" }, label: "未命中", fmt: fmtCount, desc: "缓存未命中次数" },
-    ],
-  },
-  {
-    title: "查询",
-    color: "#d97706",
-    items: [
-      { name: "rsdns_logs_queries_total", label: "查询总数", fmt: fmtCount, desc: "所有协议的查询" },
-      { name: "rsdns_rules_matched_total", label: "规则命中", fmt: fmtCount, desc: "各动作命中次数", perLabel: "action" },
-      { name: "rsdns_upstream_query_total", label: "上游命中", fmt: fmtCount, desc: "转发到各上游池的查询次数", perLabel: "upstream" },
-    ],
-  },
-  {
-    title: "域名组",
-    color: "#7c3aed",
-    items: [
-      { name: "rsdns_hosts_entries", label: "hosts 条目", fmt: fmtInt, desc: "已加载的 hosts 条目数" },
-      { name: "rsdns_hosts_hit_total", label: "hosts 匹配", fmt: fmtCount, desc: "hosts 命中次数" },
-      { name: "rsdns_groups_entries", label: "组条目", fmt: fmtInt, desc: "各组域名条目数", perGroup: true },
-      { name: "rsdns_groups_hit_total", label: "组命中", fmt: fmtCount, desc: "各组命中次数", perGroup: true },
     ],
   },
 ];
@@ -266,6 +338,69 @@ function escapeHtml(s) {
   ));
 }
 
+function setTheme(theme) {
+  if (theme === "auto") {
+    delete document.documentElement.dataset.theme;
+  } else {
+    document.documentElement.dataset.theme = theme;
+  }
+  const isDark = (theme === "dark") ||
+    (theme === "auto" && matchMedia("(prefers-color-scheme: dark)").matches);
+  document.getElementById("theme-btn").textContent = isDark ? "☀️ 白天" : "🌙 黑夜";
+  try { localStorage.setItem("rsdns-theme", theme); } catch (e) { /* 忽略 */ }
+}
+
+// ---- 主题：支持黑夜/白天（含跟随系统）----
+(function initTheme() {
+  let saved = "auto";
+  try { saved = localStorage.getItem("rsdns-theme") || "auto"; } catch (e) { /* 忽略 */ }
+  const btn = document.getElementById("theme-btn");
+  btn.addEventListener("click", () => {
+    const cur = document.documentElement.dataset.theme || "auto";
+    setTheme(cur === "auto" ? "dark" : cur === "dark" ? "light" : "auto");
+  });
+  matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => setTheme(
+    document.documentElement.dataset.theme || "auto"));
+  setTheme(saved);
+})();
+
+// ---- 自动刷新间隔：10s（默认）/ 30s / 1m ----
+const REFRESH_SECS = [10, 30, 60];
+const DEFAULT_REFRESH_SEC = 10;
+let refreshSec = DEFAULT_REFRESH_SEC;
+let timer = null;
+
+function formatSec(sec) {
+  return sec % 60 === 0 ? (sec / 60) + "m" : sec + "s";
+}
+
+function setRefreshSec(sec, { persist = true } = {}) {
+  refreshSec = sec;
+  const label = document.getElementById("refresh-label");
+  label.textContent = "刷新 " + formatSec(sec);
+  document.querySelectorAll("#refresh-btns button").forEach((b) => {
+    b.classList.toggle("active", Number(b.dataset.sec) === sec);
+  });
+  if (persist) {
+    try { localStorage.setItem("rsdns-refresh", String(sec)); } catch (e) { /* 忽略 */ }
+  }
+  clearInterval(timer);
+  timer = setInterval(refresh, sec * 1000);
+}
+
+(function initRefresh() {
+  let saved = null;
+  try {
+    const v = Number(localStorage.getItem("rsdns-refresh"));
+    if (REFRESH_SECS.includes(v)) saved = v;
+  } catch (e) { /* 忽略 */ }
+  const sec = saved || DEFAULT_REFRESH_SEC;
+  document.querySelectorAll("#refresh-btns button").forEach((b) => {
+    b.addEventListener("click", () => setRefreshSec(Number(b.dataset.sec)));
+  });
+  setRefreshSec(sec, { persist: false });
+})();
+
 async function refresh() {
   const status = document.getElementById("status");
   try {
@@ -282,7 +417,6 @@ async function refresh() {
 }
 
 refresh();
-setInterval(refresh, 3000);
 </script>
 </body>
 </html>
