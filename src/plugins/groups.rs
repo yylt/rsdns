@@ -10,7 +10,6 @@
 //! group's trie is rebuilt and atomically swapped.
 
 use log::{info, warn};
-use notify::{RecursiveMode, Watcher};
 use parking_lot::RwLock;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -19,7 +18,7 @@ use crate::common::domain_trie::{DomainSuffixTrie, DomainSuffixTrieBuilder};
 
 use crate::config::{Config, GroupConfig};
 use crate::metrics::{Counter, Gauge, MetricsRegistry};
-use crate::plugins::util::is_change_event;
+use crate::plugins::util::watch_file;
 use crate::query::{QueryContext, Step};
 
 /// A reloadable domain source file.
@@ -217,28 +216,9 @@ pub fn init(config: &Config, registry: &MetricsRegistry) -> Groups {
             let path = f.0.clone();
             let cb_state = state.clone();
             let cb_metrics = metrics.clone();
-            match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-                let Ok(event) = res else { return };
-                if !is_change_event(&event.kind) {
-                    return;
-                }
+            watch_file(&path, move || {
                 reload_group(&cb_state, &cb_metrics);
-            }) {
-                Ok(mut watcher) => {
-                    if let Err(e) = watcher.watch(&path, RecursiveMode::NonRecursive) {
-                        warn!("group '{}': failed to watch {}: {}", state.name, path.display(), e);
-                    } else {
-                        // 持有 watcher 直到进程退出，保持文件监控存活。
-                        tokio::spawn(async move {
-                            std::future::pending::<()>().await;
-                            drop(watcher);
-                        });
-                    }
-                }
-                Err(e) => {
-                    warn!("group '{}': failed to watch {}: {}", state.name, path.display(), e);
-                }
-            };
+            });
         }
         states.push(state);
     }

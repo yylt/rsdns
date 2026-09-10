@@ -8,10 +8,12 @@ use hickory_proto::op::{Message, MessageType, Metadata, OpCode, Query, ResponseC
 use hickory_proto::rr::rdata::{A, AAAA, CNAME, HTTPS, MX, TXT};
 use hickory_proto::rr::RData;
 use hickory_proto::rr::{Name, Record, RecordType};
+use log::warn;
 use notify::event::{AccessKind, AccessMode, ModifyKind};
-use notify::EventKind;
+use notify::{EventKind, RecursiveMode, Watcher};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::path::Path;
 
 use crate::plugins::cache::{CacheEntry, CacheKey, CacheRecord, DnsCache};
 
@@ -271,6 +273,62 @@ pub(crate) fn is_change_event(kind: &EventKind) -> bool {
     )
 }
 
+/// Watches `path` and calls `on_change` whenever its content is replaced.
+///
+/// The watch is installed on the **parent directory**, not on the file itself.
+/// Most writers (editors, `sed -i`, `mv tmp target`) replace the file via
+/// rename, which unlinks the inode a direct file watch is attached to: that
+/// watch is torn down by the kernel after the *first* such edit, so every
+/// later change goes unnoticed.  A directory watch survives replacement, and
+/// events for sibling files are filtered out by comparing against `path`.
+///
+/// The watcher is kept alive until process exit.
+pub(crate) fn watch_file(path: &Path, on_change: impl Fn() + Send + 'static) {
+    // notify 回报的事件路径基于 watch 时传入的目录，可能是绝对路径；
+    // 这里统一成绝对路径再比较，避免相对配置路径漏匹配。
+    let target = match std::path::absolute(path) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("cannot watch {}: {}", path.display(), e);
+            return;
+        }
+    };
+    let Some(parent) = target.parent() else {
+        warn!("cannot watch {}: no parent directory", target.display());
+        return;
+    };
+
+    let mut watcher = match notify::recommended_watcher({
+        let target = target.clone();
+        move |res: notify::Result<notify::Event>| {
+            let Ok(event) = res else { return };
+            if !is_change_event(&event.kind) {
+                return;
+            }
+            if event.paths.iter().any(|p| p == &target) {
+                on_change();
+            }
+        }
+    }) {
+        Ok(w) => w,
+        Err(e) => {
+            warn!("cannot watch {}: {}", target.display(), e);
+            return;
+        }
+    };
+
+    if let Err(e) = watcher.watch(parent, RecursiveMode::NonRecursive) {
+        warn!("cannot watch {}: {}", target.display(), e);
+        return;
+    }
+
+    // 持有 watcher 直到进程退出，保持文件监控存活。
+    tokio::spawn(async move {
+        std::future::pending::<()>().await;
+        drop(watcher);
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,6 +336,8 @@ mod tests {
     use notify::event::{
         AccessKind, AccessMode, CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind, RenameMode,
     };
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
 
     /// 构造一个设置了 RD/CD 与自定义 opcode 的查询消息。
     fn query_msg_with_flags() -> Message {
@@ -408,5 +468,58 @@ mod tests {
         assert!(!is_change_event(&EventKind::Access(AccessKind::Close(AccessMode::Read))));
         assert!(!is_change_event(&EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any))));
         assert!(!is_change_event(&EventKind::Access(AccessKind::Open(AccessMode::Any))));
+    }
+
+    /// 复现「第一次修改正常重载、第二次起失效」：写入方通过 rename 替换文件
+    /// （`sed -i` / 编辑器保存 / `mv tmp target`）时，直接监视文件本身会在第一次
+    /// 替换后随旧 inode 一起被内核摘除。`watch_file` 改看父目录，必须每次都能触发。
+    #[tokio::test]
+    async fn test_watch_file_survives_rename_replacement() {
+        let dir = std::env::temp_dir().join(format!("rsdns-watchtest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("domains.txt");
+        std::fs::write(&target, "one.example\n").unwrap();
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let cb_hits = hits.clone();
+        let cb_seen = seen.clone();
+        let cb_target = target.clone();
+        watch_file(&target, move || {
+            let content = std::fs::read_to_string(&cb_target).unwrap_or_default();
+            cb_seen.lock().push(content.trim().to_string());
+            cb_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        // 前几次修改用 rename 替换（原实现只会在第一次生效），最后一次原地追加。
+        for n in 1..=3 {
+            let tmp = dir.join(format!("domains.txt.tmp{n}"));
+            std::fs::write(&tmp, format!("edit{n}.example\n")).unwrap();
+            std::fs::rename(&tmp, &target).unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        }
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&target).unwrap();
+            f.write_all(b"edit4.example\n").unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        let observed = seen.lock().clone();
+        assert!(
+            observed.iter().any(|c| c.contains("edit2.example")),
+            "第二次修改必须触发重载，实际观察到: {observed:?}"
+        );
+        assert!(
+            observed.iter().any(|c| c.contains("edit3.example")),
+            "第三次修改必须触发重载，实际观察到: {observed:?}"
+        );
+        assert!(
+            observed.iter().any(|c| c.contains("edit4.example")),
+            "原地追加必须触发重载，实际观察到: {observed:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
