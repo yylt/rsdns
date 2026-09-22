@@ -17,8 +17,7 @@
 //! and atomically swapping it on change.
 
 use ahash::AHashMap;
-use log::{error, info, warn};
-use notify::{RecursiveMode, Watcher};
+use log::{error, info};
 use parking_lot::RwLock;
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -28,7 +27,7 @@ use crate::common::domain_trie::{DomainSuffixTrie, DomainSuffixTrieBuilder};
 
 use crate::config::Config;
 use crate::metrics::{Counter, Gauge, MetricsRegistry};
-use crate::plugins::util::{build_hosts_response, build_servfail, is_change_event};
+use crate::plugins::util::{build_hosts_response, build_servfail, watch_file};
 use crate::query::{QueryContext, Step};
 
 /// Result of a hosts trie lookup.
@@ -232,30 +231,11 @@ pub fn init(config: &Config, registry: &MetricsRegistry) -> Hosts {
         let cb_entries = entries.clone();
         let cb_current = current.clone();
         let cb_metrics = metrics.clone();
-        match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            let Ok(event) = res else { return };
-            if !is_change_event(&event.kind) {
-                return;
-            }
+        watch_file(&path, move || {
             let new_trie = build_hosts_trie(&cb_entries);
             cb_metrics.entries.set(new_trie.ips.len() as u64);
             *cb_current.write() = Arc::new(new_trie);
-        }) {
-            Ok(mut watcher) => {
-                if let Err(e) = watcher.watch(&path, RecursiveMode::NonRecursive) {
-                    warn!("hosts: failed to watch {}: {}", path.display(), e);
-                } else {
-                    // 持有 watcher 直到进程退出，保持文件监控存活。
-                    tokio::spawn(async move {
-                        std::future::pending::<()>().await;
-                        drop(watcher);
-                    });
-                }
-            }
-            Err(e) => {
-                warn!("hosts: failed to watch {}: {}", path.display(), e);
-            }
-        }
+        });
     }
 
     Hosts { trie: current, metrics }

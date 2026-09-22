@@ -6,15 +6,65 @@
 <title>rsdns 状态</title>
 <style>
   :root {
+    color-scheme: light dark;
     --bg: #f4f6fb;
     --card: #ffffff;
+    --card2: #fafbfe;
+    --card-border: #e5e7eb;
     --text: #1f2937;
     --muted: #6b7280;
+    --shadow: 0 1px 3px rgba(0,0,0,.08);
     --mem: #2563eb;
     --cache: #059669;
     --query: #d97706;
     --group: #7c3aed;
+    --upstream: #dc2626;
     --radius: 14px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f172a;
+      --card: #1e293b;
+      --card2: #243247;
+      --card-border: #334155;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --shadow: 0 1px 3px rgba(0,0,0,.4);
+      --mem: #60a5fa;
+      --cache: #34d399;
+      --query: #fbbf24;
+      --group: #a78bfa;
+      --upstream: #f87171;
+      --radius: 14px;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f172a;
+    --card: #1e293b;
+    --card2: #243247;
+    --card-border: #334155;
+    --text: #e2e8f0;
+    --muted: #94a3b8;
+    --shadow: 0 1px 3px rgba(0,0,0,.4);
+    --mem: #60a5fa;
+    --cache: #34d399;
+    --query: #fbbf24;
+    --group: #a78bfa;
+    --upstream: #f87171;
+  }
+  :root[data-theme="light"] {
+    --bg: #f4f6fb;
+    --card: #ffffff;
+    --card2: #fafbfe;
+    --card-border: #e5e7eb;
+    --text: #1f2937;
+    --muted: #6b7280;
+    --shadow: 0 1px 3px rgba(0,0,0,.08);
+    --mem: #2563eb;
+    --cache: #059669;
+    --query: #d97706;
+    --group: #7c3aed;
+    --upstream: #dc2626;
   }
   * { box-sizing: border-box; }
   body {
@@ -33,6 +83,25 @@
     gap: 6px;
     margin-bottom: 16px;
   }
+  .controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .controls button {
+    border: 1px solid var(--card-border);
+    border-radius: 999px;
+    background: var(--card);
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1;
+    padding: 5px 9px;
+    cursor: pointer;
+  }
+  .controls button:hover { color: var(--text); border-color: var(--muted); }
+  .controls button.active { color: var(--text); border-color: currentColor; }
   #status { font-size: 12px; color: var(--muted); }
   #status.error { color: #dc2626; }
   .modules { display: grid; grid-template-columns: 1fr; gap: 16px; }
@@ -41,7 +110,7 @@
     background: var(--card);
     border-radius: var(--radius);
     padding: 14px 16px;
-    box-shadow: 0 1px 3px rgba(0,0,0,.08);
+    box-shadow: var(--shadow);
   }
   .module h2 {
     font-size: 15px;
@@ -53,8 +122,8 @@
   .cards { display: grid; grid-template-columns: 1fr; gap: 10px; }
   @media (min-width: 720px) { .cards { grid-template-columns: 1fr 1fr; } }
   .card {
-    background: #fafbfe;
-    border: 1px solid #e5e7eb;
+    background: var(--card2);
+    border: 1px solid var(--card-border);
     border-radius: 12px;
     padding: 10px 12px;
     border-left: 4px solid var(--card-color);
@@ -68,6 +137,9 @@
     word-break: break-word;
   }
   .card .value small { font-size: 13px; font-weight: 400; color: var(--muted); }
+  .card .value .hist-tag { font-size: 13px; color: var(--muted); margin-right: 2px; }
+  .card .value .hist-group { font-size: 15px; font-weight: 600; line-height: 1.35; font-variant-numeric: tabular-nums; }
+  .card .value .hist-group + .hist-group { margin-top: 3px; }
   .card .desc { font-size: 11px; color: var(--muted); margin-top: 4px; }
   footer {
     margin-top: 18px;
@@ -80,10 +152,17 @@
 <body>
 <header>
   <span id="status">加载中…</span>
+  <span class="controls">
+    <button id="theme-btn" title="切换黑夜/白天主题">🌙 黑夜</button>
+    <span id="refresh-label" title="自动刷新间隔">刷新 10s</span>
+    <span class="seg" id="refresh-btns">
+      <button data-sec="10">10s</button><button data-sec="30">30s</button><button data-sec="60">1m</button>
+    </span>
+  </span>
 </header>
 <div class="modules" id="modules"></div>
 <footer>
-  <span>/metrics</span> · 每 3 秒自动刷新
+  <span>/metrics</span> · 自动刷新
 </footer>
 <script>
 "use strict";
@@ -109,13 +188,40 @@ function fmtCount(v) {
   if (v >= 1e3) return (v / 1e3).toFixed(1) + " k";
   return Math.round(v).toLocaleString("en-US");
 }
+function fmtSeconds(v) {
+  if (!isFinite(v)) return "0";
+  if (v < 0.001) return (v * 1e6).toFixed(0) + " µs";
+  if (v < 1) return (v * 1000).toFixed(v < 0.01 ? 1 : 0) + " ms";
+  return v.toFixed(2) + " s";
+}
 
-// ---- 模块白名单（少而精）：内存 / 缓存 / 查询 / 组 ----
+// ---- 模块（少而精）：查询 / 域名组 / 内存 / 缓存 / 上游 ----
 // match: 要匹配的 label（缺省表示无 label 的 series）
 const MODULES = [
   {
+    title: "查询",
+    color: "var(--query)",
+    items: [
+      { name: "rsdns_queries_total", label: "收到查询", fmt: fmtCount, desc: "所有协议入站查询（全量）", perLabel: "proto" },
+      { name: "rsdns_query_rcode_total", label: "应答 rcode", fmt: fmtCount, desc: "最终应答 rcode 分布", perLabel: "rcode" },
+      { name: "rsdns_query_qtype_total", label: "查询类型", fmt: fmtCount, desc: "查询类型分布", perLabel: "qtype" },
+      { name: "rsdns_rules_matched_total", label: "规则命中", fmt: fmtCount, desc: "各动作命中次数", perLabel: "action" },
+      { name: "rsdns_query_duration_seconds", label: "端到端耗时", fmt: fmtSeconds, desc: "P50/P95/P99 分布（秒，按 proto）", histogram: true },
+    ],
+  },
+  {
+    title: "域名组",
+    color: "var(--group)",
+    items: [
+      { name: "rsdns_hosts_entries", label: "hosts 条目", fmt: fmtInt, desc: "已加载的 hosts 条目数" },
+      { name: "rsdns_hosts_hit_total", label: "hosts 匹配", fmt: fmtCount, desc: "hosts 命中次数" },
+      { name: "rsdns_groups_entries", label: "组条目", fmt: fmtInt, desc: "各组域名条目数", perGroup: true },
+      { name: "rsdns_groups_hit_total", label: "组命中", fmt: fmtCount, desc: "各组命中次数", perGroup: true },
+    ],
+  },
+  {
     title: "内存",
-    color: "#2563eb",
+    color: "var(--mem)",
     items: [
       { name: "rsdns_jemalloc_allocated_bytes", label: "已分配", fmt: fmtBytes, desc: "stats.allocated" },
       { name: "rsdns_jemalloc_active_bytes", label: "活跃页", fmt: fmtBytes, desc: "stats.active" },
@@ -125,7 +231,7 @@ const MODULES = [
   },
   {
     title: "缓存",
-    color: "#059669",
+    color: "var(--cache)",
     items: [
       { name: "rsdns_cache_entries", label: "缓存条目", fmt: fmtInt, desc: "当前缓存记录数" },
       { name: "rsdns_cache_lookup_total", match: { result: "fresh" }, label: "命中", fmt: fmtCount, desc: "缓存命中次数" },
@@ -133,22 +239,15 @@ const MODULES = [
     ],
   },
   {
-    title: "查询",
-    color: "#d97706",
+    title: "上游",
+    color: "var(--upstream)",
     items: [
-      { name: "rsdns_logs_queries_total", label: "查询总数", fmt: fmtCount, desc: "所有协议的查询" },
-      { name: "rsdns_rules_matched_total", label: "规则命中", fmt: fmtCount, desc: "各动作命中次数", perLabel: "action" },
-      { name: "rsdns_upstream_query_total", label: "上游命中", fmt: fmtCount, desc: "转发到各上游池的查询次数", perLabel: "upstream" },
-    ],
-  },
-  {
-    title: "域名组",
-    color: "#7c3aed",
-    items: [
-      { name: "rsdns_hosts_entries", label: "hosts 条目", fmt: fmtInt, desc: "已加载的 hosts 条目数" },
-      { name: "rsdns_hosts_hit_total", label: "hosts 匹配", fmt: fmtCount, desc: "hosts 命中次数" },
-      { name: "rsdns_groups_entries", label: "组条目", fmt: fmtInt, desc: "各组域名条目数", perGroup: true },
-      { name: "rsdns_groups_hit_total", label: "组命中", fmt: fmtCount, desc: "各组命中次数", perGroup: true },
+      { name: "rsdns_upstream_query_total", label: "上游请求", fmt: fmtCount, desc: "转发到各上游池的查询次数", perLabel: "upstream" },
+      { name: "rsdns_upstream_error_total", label: "上游错误", fmt: fmtCount, desc: "上游 transport 错误（按上游分池）", groupBy: "upstream", perLabel: "kind" },
+      { name: "rsdns_upstream_rcode_total", label: "上游 rcode", fmt: fmtCount, desc: "上游应答 rcode 分布（按上游分池）", groupBy: "upstream", perLabel: "rcode" },
+      { name: "rsdns_upstream_latency_seconds", label: "上游耗时", fmt: fmtSeconds, desc: "各上游池 P50/P95/P99 分布（秒，按上游名）", histogram: true },
+      { name: "rsdns_upstream_pool_connections", label: "空闲连接", fmt: fmtInt, desc: "各上游池空闲连接数", perLabel: "upstream" },
+      { name: "rsdns_upstream_pool_checkout_total", label: "连接借出", fmt: fmtCount, desc: "连接池借出次数（按上游分池）", groupBy: "upstream", perLabel: "result" },
     ],
   },
 ];
@@ -186,6 +285,51 @@ function seriesMatch(s, item) {
   return true;
 }
 
+// 从直方图系列（<name>_bucket{le} 与 <name>_count）聚合出 P50/P95/P99 与总数。
+// 按 upstream（优先）/ proto 分组；上游耗时按上游池名聚合，端到端耗时按 proto 聚合。
+// 返回 [{labels, p50, p95, p99, count}]，其中每个分位数为 {v, over}：
+// over 表示真实值超过最大有限桶（落在 +Inf 桶内），渲染成 "> 最大有限上界"。
+function summarizeHistogram(series, itemName) {
+  const byKey = new Map();
+  const labelKeys = ["upstream", "proto"].filter((k) => series.some((s) => s.labels[k] !== undefined));
+  const keyOf = (s) => labelKeys.map((k) => s.labels[k] || "").join("\u0001");
+  for (const s of series) {
+    const key = keyOf(s);
+    if (!byKey.has(key)) {
+      const labels = {};
+      for (const k of labelKeys) labels[k] = s.labels[k];
+      byKey.set(key, { labels, buckets: [], count: 0 });
+    }
+    const h = byKey.get(key);
+    if (s.name.endsWith("_bucket")) {
+      const le = parseFloat(s.labels.le);
+      h.buckets.push({ le: isNaN(le) ? Infinity : le, count: s.value });
+    } else if (s.name.endsWith("_count")) {
+      h.count = s.value;
+    }
+  }
+  const out = [];
+  for (const h of byKey.values()) {
+    h.buckets.sort((a, b) => a.le - b.le);
+    // 分位数只落在某个桶的上界上；命中 +Inf 桶时只能断言"大于最大有限上界"。
+    const pct = (p) => {
+      if (h.count === 0) return { v: 0, over: false };
+      const target = p * h.count;
+      for (const b of h.buckets) {
+        if (b.count < target) continue;
+        if (b.le === Infinity) {
+          const last = h.buckets.filter((x) => x.le !== Infinity).pop();
+          return { v: last ? last.le : 0, over: true };
+        }
+        return { v: b.le, over: false };
+      }
+      return { v: 0, over: false };
+    };
+    out.push({ labels: h.labels, p50: pct(0.5), p95: pct(0.95), p99: pct(0.99), count: h.count });
+  }
+  return out;
+}
+
 function fmtValue(item, s) {
   if (!s) return "0";
   return item.fmt(s.value);
@@ -204,6 +348,79 @@ function render(series) {
     const cards = document.createElement("div");
     cards.className = "cards";
     for (const item of mod.items) {
+      const card = document.createElement("div");
+      card.className = "card";
+      card.style.setProperty("--card-color", mod.color);
+      const lab = document.createElement("div");
+      lab.className = "label";
+      if (item.perGroup) lab.textContent = item.label + "（各组）";
+      else if (item.perLabel) lab.textContent = item.label + "（按 " + item.perLabel + "）";
+      else lab.textContent = item.label;
+      const val = document.createElement("div");
+      val.className = "value";
+
+      if (item.histogram) {
+        // 直方图由 <name>_bucket{le} / <name>_count 多组系列构成；按前缀聚合。
+        const histSeries = series.filter((s) => s.name === item.name + "_bucket" || s.name === item.name + "_count");
+        const summaries = summarizeHistogram(histSeries, item.name);
+        if (summaries.length === 0) {
+          val.textContent = "0";
+        } else {
+          // 每个分组独立成行：组名 + 行内 P50 · P95 · P99（不显示数量）；分组间换行、行距更小。
+          val.innerHTML = summaries
+            .map((h) => {
+              const tag = h.labels.upstream || h.labels.proto || "";
+              const head = tag ? '<span class="hist-tag">' + escapeHtml(tag) + "</span> " : "";
+              // p 为 {v, over}：over 时真实分位数只在最大有限上界之上，标 ">" 而不给数值。
+              const line = (name, p) => name + " <small>" + (p.over ? "&gt; " + fmtSeconds(p.v) : fmtSeconds(p.v)) + "</small>";
+              return '<div class="hist-group">' + head + [line("P50", h.p50), line("P95", h.p95), line("P99", h.p99)].join(" · ") + "</div>";
+            })
+            .join("");
+        }
+        card.appendChild(lab);
+        card.appendChild(val);
+        cards.appendChild(card);
+        continue;
+      }
+
+      if (item.groupBy) {
+        // 按 groupBy（如 upstream）分组，每组内再按 perLabel（如 kind/rcode/result）拆分；
+        // 每组独立成行、行距更小。
+        const matched = series.filter((s) => seriesMatch(s, item));
+        const groups = new Map();
+        for (const s of matched) {
+          const gk = s.labels[item.groupBy] || "?";
+          if (!groups.has(gk)) groups.set(gk, []);
+          groups.get(gk).push(s);
+        }
+        if (groups.size === 0) {
+          val.textContent = "0";
+        } else {
+          val.innerHTML = [...groups.entries()]
+            .map(([gk, gs]) => {
+              let inner;
+              if (item.perLabel) {
+                const byLabel = new Map();
+                for (const s of gs) {
+                  const k = s.labels[item.perLabel] || "?";
+                  byLabel.set(k, (byLabel.get(k) || 0) + s.value);
+                }
+                inner = [...byLabel.entries()]
+                  .map(([k, v]) => escapeHtml(k) + " <small>" + item.fmt(v) + "</small>")
+                  .join(" · ");
+              } else {
+                inner = "<small>" + item.fmt(gs.reduce((a, s) => a + s.value, 0)) + "</small>";
+              }
+              return '<div class="hist-group"><span class="hist-tag">' + escapeHtml(gk) + "</span> " + inner + "</div>";
+            })
+            .join("");
+        }
+        card.appendChild(lab);
+        card.appendChild(val);
+        cards.appendChild(card);
+        continue;
+      }
+
       let matched = series.filter((s) => seriesMatch(s, item));
       // perLabel 指标：同一 label 值（如同一上游池的不同 proto）合并求和，
       // 否则一张卡片会出现 "std 5 · std 3" 的重复项。
@@ -223,16 +440,6 @@ function render(series) {
       if (!item.match && !item.perGroup && !item.perLabel && matched.length > 1) {
         matched = [{ name: item.name, labels: {}, value: matched.reduce((a, s) => a + s.value, 0) }];
       }
-      const card = document.createElement("div");
-      card.className = "card";
-      card.style.setProperty("--card-color", mod.color);
-      const lab = document.createElement("div");
-      lab.className = "label";
-      if (item.perGroup) lab.textContent = item.label + "（各组）";
-      else if (item.perLabel) lab.textContent = item.label + "（按 " + item.perLabel + "）";
-      else lab.textContent = item.label;
-      const val = document.createElement("div");
-      val.className = "value";
       const labelKey = item.perGroup ? "group" : item.perLabel;
       if (labelKey && matched.length > 0) {
         val.innerHTML = matched
@@ -266,6 +473,69 @@ function escapeHtml(s) {
   ));
 }
 
+function setTheme(theme) {
+  if (theme === "auto") {
+    delete document.documentElement.dataset.theme;
+  } else {
+    document.documentElement.dataset.theme = theme;
+  }
+  const isDark = (theme === "dark") ||
+    (theme === "auto" && matchMedia("(prefers-color-scheme: dark)").matches);
+  document.getElementById("theme-btn").textContent = isDark ? "☀️ 白天" : "🌙 黑夜";
+  try { localStorage.setItem("rsdns-theme", theme); } catch (e) { /* 忽略 */ }
+}
+
+// ---- 主题：支持黑夜/白天（含跟随系统）----
+(function initTheme() {
+  let saved = "auto";
+  try { saved = localStorage.getItem("rsdns-theme") || "auto"; } catch (e) { /* 忽略 */ }
+  const btn = document.getElementById("theme-btn");
+  btn.addEventListener("click", () => {
+    const cur = document.documentElement.dataset.theme || "auto";
+    setTheme(cur === "auto" ? "dark" : cur === "dark" ? "light" : "auto");
+  });
+  matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => setTheme(
+    document.documentElement.dataset.theme || "auto"));
+  setTheme(saved);
+})();
+
+// ---- 自动刷新间隔：10s（默认）/ 30s / 1m ----
+const REFRESH_SECS = [10, 30, 60];
+const DEFAULT_REFRESH_SEC = 10;
+let refreshSec = DEFAULT_REFRESH_SEC;
+let timer = null;
+
+function formatSec(sec) {
+  return sec % 60 === 0 ? (sec / 60) + "m" : sec + "s";
+}
+
+function setRefreshSec(sec, { persist = true } = {}) {
+  refreshSec = sec;
+  const label = document.getElementById("refresh-label");
+  label.textContent = "刷新 " + formatSec(sec);
+  document.querySelectorAll("#refresh-btns button").forEach((b) => {
+    b.classList.toggle("active", Number(b.dataset.sec) === sec);
+  });
+  if (persist) {
+    try { localStorage.setItem("rsdns-refresh", String(sec)); } catch (e) { /* 忽略 */ }
+  }
+  clearInterval(timer);
+  timer = setInterval(refresh, sec * 1000);
+}
+
+(function initRefresh() {
+  let saved = null;
+  try {
+    const v = Number(localStorage.getItem("rsdns-refresh"));
+    if (REFRESH_SECS.includes(v)) saved = v;
+  } catch (e) { /* 忽略 */ }
+  const sec = saved || DEFAULT_REFRESH_SEC;
+  document.querySelectorAll("#refresh-btns button").forEach((b) => {
+    b.addEventListener("click", () => setRefreshSec(Number(b.dataset.sec)));
+  });
+  setRefreshSec(sec, { persist: false });
+})();
+
 async function refresh() {
   const status = document.getElementById("status");
   try {
@@ -282,7 +552,6 @@ async function refresh() {
 }
 
 refresh();
-setInterval(refresh, 3000);
 </script>
 </body>
 </html>

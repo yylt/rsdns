@@ -127,7 +127,8 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         rules,
         balance,
     };
-    let server = Arc::new(DnsServer::new(pipeline));
+    let server_metrics = server::ServerMetrics::new(&metrics);
+    let server = Arc::new(DnsServer::new(pipeline, server_metrics));
 
     // 3. 解析监听地址；加密 bind（tls:// / https:// / h3://）的 TLS 证书在
     //    绑定之前解析（`tls::server_config`）。任一失败 → 返回错误，进程

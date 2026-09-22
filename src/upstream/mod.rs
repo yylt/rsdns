@@ -86,7 +86,7 @@ use std::time::Instant;
 use crate::common::tls::default_tls_client_config;
 
 use crate::config::Config;
-use crate::metrics::{Counter, MetricsRegistry};
+use crate::metrics::{Counter, Histogram, MetricsRegistry};
 
 use self::config::{parse_cooldown, CooldownConfig, QueryModeConfig, RawPoolConfig};
 use self::pool::{ConnectionPool, PreferFamily};
@@ -710,6 +710,8 @@ fn build_resolved_pool(cfg: &UpstreamConfig, addrs: Vec<SocketAddr>) -> Arc<Conn
 struct UpstreamMetrics {
     query_total: Counter,
     error_total: Counter,
+    rcode_total: Counter,
+    latency_seconds: Histogram,
 }
 
 impl UpstreamMetrics {
@@ -717,6 +719,17 @@ impl UpstreamMetrics {
         Self {
             query_total: registry.counter("rsdns_upstream_query_total", "Upstream queries", &["upstream", "proto"]),
             error_total: registry.counter("rsdns_upstream_error_total", "Upstream errors", &["upstream", "kind"]),
+            rcode_total: registry.counter(
+                "rsdns_upstream_rcode_total",
+                "Upstream response rcode distribution",
+                &["upstream", "rcode"],
+            ),
+            latency_seconds: registry.histogram(
+                "rsdns_upstream_latency_seconds",
+                "Upstream request latency",
+                &["upstream", "proto"],
+                crate::metrics::DEFAULT_BUCKETS,
+            ),
         }
     }
 }
@@ -737,13 +750,25 @@ impl Upstreams {
             .groups
             .get(name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("upstream {} not found", name)))?;
-        let result = group.query(msg).await;
-
         let proto = group.proto();
+        let start = std::time::Instant::now();
+        let result = group.query(msg).await;
+        let elapsed = start.elapsed().as_secs_f64();
+
         self.metrics.query_total.with_label_values(&[name, proto]).inc();
+        self.metrics
+            .latency_seconds
+            .with_label_values(&[name, proto])
+            .observe(elapsed);
         if let Err(e) = &result {
             let kind = classify_error(e);
             self.metrics.error_total.with_label_values(&[name, kind]).inc();
+        } else if let Ok(resp) = &result {
+            let rcode: u16 = resp.metadata.response_code.into();
+            self.metrics
+                .rcode_total
+                .with_label_values(&[name, crate::metrics::rcode_label(rcode)])
+                .inc();
         }
         result
     }
