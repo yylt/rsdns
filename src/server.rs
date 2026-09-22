@@ -9,6 +9,7 @@
 //! construction/teardown around the pipeline.
 
 use hickory_proto::op::Message;
+use hickory_proto::op::ResponseCode;
 
 use bytes::Buf;
 use log::{error, info};
@@ -52,14 +53,48 @@ pub struct Pipeline {
     pub balance: balance::Balance,
 }
 
+/// End-to-end server metrics, recorded once per inbound query in
+/// [`DnsServer::handle_query`].
+#[derive(Clone)]
+pub struct ServerMetrics {
+    queries_total: crate::metrics::Counter,
+    parse_errors_total: crate::metrics::Counter,
+    rcode_total: crate::metrics::Counter,
+    qtype_total: crate::metrics::Counter,
+    duration_seconds: crate::metrics::Histogram,
+}
+
+impl ServerMetrics {
+    pub fn new(registry: &crate::metrics::MetricsRegistry) -> Self {
+        Self {
+            queries_total: registry.counter("rsdns_queries_total", "Inbound DNS queries", &["proto"]),
+            parse_errors_total: registry.counter(
+                "rsdns_query_parse_errors_total",
+                "Inbound packet parse failures",
+                &[],
+            ),
+            rcode_total: registry.counter("rsdns_query_rcode_total", "Final response rcode distribution", &["rcode"]),
+            qtype_total: registry.counter("rsdns_query_qtype_total", "Query type distribution", &["qtype"]),
+            duration_seconds: registry.histogram(
+                "rsdns_query_duration_seconds",
+                "End-to-end query handling latency",
+                &["proto"],
+                crate::metrics::DEFAULT_BUCKETS,
+            ),
+        }
+    }
+}
+
 pub struct DnsServer {
     pipeline: Arc<Pipeline>,
+    metrics: ServerMetrics,
 }
 
 impl DnsServer {
-    pub fn new(pipeline: Pipeline) -> Self {
+    pub fn new(pipeline: Pipeline, metrics: ServerMetrics) -> Self {
         Self {
             pipeline: Arc::new(pipeline),
+            metrics,
         }
     }
 
@@ -422,6 +457,7 @@ impl DnsServer {
     pub fn clone_inner(&self) -> Self {
         Self {
             pipeline: self.pipeline.clone(),
+            metrics: self.metrics.clone(),
         }
     }
 
@@ -437,12 +473,23 @@ impl DnsServer {
     /// rules stage.
     async fn handle_query(&self, data: &[u8], client_addr: SocketAddr, proto: &'static str) -> io::Result<Vec<u8>> {
         let start = Instant::now();
-        let msg = Message::from_vec(data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        self.metrics.queries_total.with_label_values(&[proto]).inc();
 
-        let query = msg
-            .queries
-            .first()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no question"))?;
+        let msg = match Message::from_vec(data) {
+            Ok(m) => m,
+            Err(e) => {
+                self.metrics.parse_errors_total.inc();
+                return Err(io::Error::new(io::ErrorKind::InvalidData, e));
+            }
+        };
+
+        let query = match msg.queries.first() {
+            Some(q) => q,
+            None => {
+                self.metrics.parse_errors_total.inc();
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "no question"));
+            }
+        };
 
         let mut name = query.name().to_lowercase().to_ascii();
         name.truncate(name.trim_end_matches('.').len());
@@ -500,6 +547,26 @@ impl DnsServer {
         if let Some(r) = ctx.response.as_mut() {
             r.metadata.id = msg_id;
         }
+
+        // 端到端指标：最终 rcode / 查询类型 / 处理耗时。
+        let rcode: ResponseCode = ctx
+            .response
+            .as_ref()
+            .map(|r| r.metadata.response_code)
+            .unwrap_or(ResponseCode::ServFail);
+        self.metrics
+            .rcode_total
+            .with_label_values(&[crate::metrics::rcode_label(rcode.into())])
+            .inc();
+        self.metrics
+            .qtype_total
+            .with_label_values(&[&format!("{}", qtype)])
+            .inc();
+        self.metrics
+            .duration_seconds
+            .with_label_values(&[proto])
+            .observe(start.elapsed().as_secs_f64());
+
         // 回卷：cache 写入（原 TTL）→ 查询日志。
         self.pipeline.cache.write_back(&ctx).await;
         self.pipeline.logs.log_query(&ctx).await;
@@ -645,14 +712,17 @@ mod tests {
         let upstreams = upstream::init(&config, &metrics).await.unwrap();
         let rules = rules::init(&config, &metrics, upstreams);
         let balance = balance::init(&config);
-        Arc::new(DnsServer::new(Pipeline {
-            logs,
-            hosts,
-            groups,
-            cache,
-            rules,
-            balance,
-        }))
+        Arc::new(DnsServer::new(
+            Pipeline {
+                logs,
+                hosts,
+                groups,
+                cache,
+                rules,
+                balance,
+            },
+            ServerMetrics::new(&metrics),
+        ))
     }
 
     /// Server TLS config + a client config that trusts the same cert.

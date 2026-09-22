@@ -247,8 +247,12 @@ balance:
 #             colored rounded cards; auto-refreshes every 3s)
 #   /metrics  Prometheus text format (for scrapers)
 # Registered metrics:
+#   rsdns_queries_total{proto}, rsdns_query_parse_errors_total,
+#   rsdns_query_rcode_total{rcode}, rsdns_query_qtype_total{qtype},
+#   rsdns_query_duration_seconds{proto} (histogram),
 #   rsdns_logs_*, rsdns_hosts_*, rsdns_groups_*, rsdns_cache_*,
-#   rsdns_rules_*, rsdns_upstream_*, rsdns_upstream_pool_*,
+#   rsdns_rules_*, rsdns_upstream_* (incl. rsdns_upstream_rcode_total,
+#     rsdns_upstream_latency_seconds histogram), rsdns_upstream_pool_*,
 #   rsdns_jemalloc_* (under the jemalloc feature)
 ui:
   bind: "127.0.0.1:8153"
