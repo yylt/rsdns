@@ -710,7 +710,7 @@ mod tests {
         let groups = groups::init(&config, &metrics);
         let cache = cache::init(&config, &metrics);
         let upstreams = upstream::init(&config, &metrics).await.unwrap();
-        let rules = rules::init(&config, &metrics, upstreams);
+        let rules = rules::init(&config, &metrics, upstreams).unwrap();
         let balance = balance::init(&config);
         Arc::new(DnsServer::new(
             Pipeline {
