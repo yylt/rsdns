@@ -197,11 +197,13 @@ pub fn parse_match_target(s: &str) -> Result<MatchTarget, String> {
     Ok(MatchTarget::InlineDomains(domains))
 }
 
-/// 解析单个 `{N}.{domain}` 占位符模板。
+/// 解析单个 `{1}.{domain}` 占位符模板。
 ///
-/// 语法：开头是若干 `{N}`（N ≥ 1）占位符（点分隔），之后必须紧跟 `.`
-/// 加字面域名后缀（如 `.foo`、`.foo.bar`）；占位符只允许出现在后缀之前。
-/// 占位符之间必须以 `.` 分隔；字面后缀沿用域名校验。
+/// 语法：若干 `{N}`（N ≥ 1）占位符点分隔地放在**最前面**，之后必须紧跟
+/// 字面域名后缀（如 `{1}.lan`、`{1}.{2}.foo.bar`）。模板不支持字面前缀
+/// ——`ui.{1}.lan`、`cdn.{1}.com`、`{1}.cn.{2}.com` 一律报配置错误（{N}
+/// 的语义是「后缀前第 N 个 label」，掺入字面前缀后无法做后缀匹配）。
+/// 字面后缀沿用域名校验。
 fn parse_template(s: &str) -> Result<TemplatePattern, String> {
     let segments: Vec<&str> = s.split('.').collect();
     let mut placeholders = Vec::new();
@@ -222,7 +224,10 @@ fn parse_template(s: &str) -> Result<TemplatePattern, String> {
         idx += 1;
     }
     if placeholders.is_empty() {
-        return Err(format!("invalid match target {s:?}: expected {{N}} before the domain suffix"));
+        return Err(format!(
+            "invalid match target {s:?}: only suffix templates are supported, expected {{N}} at the front \
+             followed by a domain suffix (e.g. \"{{1}}.example.com\")"
+        ));
     }
     if idx == segments.len() {
         return Err(format!(
@@ -233,7 +238,8 @@ fn parse_template(s: &str) -> Result<TemplatePattern, String> {
     let suffix = segments[idx..].join(".");
     if suffix.contains('{') || suffix.contains('}') {
         return Err(format!(
-            "invalid match target {s:?}: placeholder must be followed by a literal domain suffix"
+            "invalid match target {s:?}: only suffix templates are supported, all {{N}} must precede the \
+             domain suffix (e.g. \"{{1}}.{{2}}.example.com\")"
         ));
     }
     let suffix = validate_domain(&suffix).ok_or_else(|| format!("invalid match target {s:?}: bad domain suffix"))?;
@@ -542,25 +548,27 @@ pub struct Rules {
 }
 
 /// Builds the rules stage from the `rules:` config section (or none).
-pub fn init(config: &Config, registry: &MetricsRegistry, upstreams: Arc<crate::upstream::Upstreams>) -> Rules {
+///
+/// Configuration errors are **fatal**: an unparsable `match`, or a `rules:`
+/// section that does not deserialize, aborts startup with the offending
+/// entry's index and reason (silently dropping a rule would leave queries
+/// that should be routed to the default NXDOMAIN answer).
+pub fn init(
+    config: &Config,
+    registry: &MetricsRegistry,
+    upstreams: Arc<crate::upstream::Upstreams>,
+) -> Result<Rules, String> {
     let raw = config.plugin_sections.get("rules").cloned().unwrap_or_default();
     let configs: Vec<RuleConfig> = if raw.is_null() {
         Vec::new()
     } else {
-        serde_yaml::from_value(raw).unwrap_or_default()
+        serde_yaml::from_value(raw).map_err(|e| format!("invalid `rules` section: {e}"))?
     };
     let mut rules = Vec::with_capacity(configs.len());
-    for rc in configs {
+    for (idx, rc) in configs.into_iter().enumerate() {
         let target = match &rc.r#match {
-            Some(s) => parse_match_target(s),
-            None => Ok(MatchTarget::MatchAll),
-        };
-        let target = match target {
-            Ok(t) => t,
-            Err(e) => {
-                warn!("rule parse error: {}", e);
-                continue;
-            }
+            Some(s) => parse_match_target(s).map_err(|e| format!("rules[{idx}]: {e}"))?,
+            None => MatchTarget::MatchAll,
         };
         let qtype = rc.qtype.as_ref().map(|qt| parse_qtype(qt));
         let action = match &rc.action {
@@ -610,13 +618,13 @@ pub fn init(config: &Config, registry: &MetricsRegistry, upstreams: Arc<crate::u
         .iter()
         .any(|r| matches!(&r.action, RuleAction::Forward { cf_ech: Some(_), .. }))
         .then(|| Arc::new(DnsCache::new_metric(64, 60, 3600, false)));
-    Rules {
+    Ok(Rules {
         rules,
         inline_trie,
         upstreams,
         metrics: std::sync::OnceLock::from(metrics),
         ech_cache,
-    }
+    })
 }
 
 fn parse_qtype(s: &str) -> hickory_proto::rr::RecordType {
@@ -1323,7 +1331,8 @@ mod tests {
 
     #[test]
     fn test_parse_rejects_bad_templates() {
-        // 占位符后必须有合法域名后缀；{N} 须为正整数且只出现在最前。
+        // 占位符后必须有合法域名后缀；{N} 须为正整数且只出现在最前，
+        // 不允许任何字面前缀（只能后缀匹配）。
         for bad in [
             "{1}",
             "{1}.",
@@ -1334,7 +1343,9 @@ mod tests {
             "example.com.{1}",
             "{1}{2}.example.com",
             "cdn.{1}.example.com",
+            "ui.{1}.lan",
             "a.{1}.example.com",
+            "{1}.cn.{2}.com",
             ".{1}.example.com",
             "{1}..example.com",
             "{1}.example..com",
@@ -1344,9 +1355,55 @@ mod tests {
             ",{1}.a.com",
             "{1}.a.com,{1}",
             "cdn.{1}.a.com,{1}.b.com",
+            "{1}.lan,ui.{1}.lan",
         ] {
             assert!(parse_match_target(bad).is_err(), "should reject: {bad:?}");
         }
+    }
+
+    /// 回归：`match: "{1}.lan,ui.{1}.lan"`（字面前缀段）此前只打一条 warn
+    /// 并被静默丢弃——整条规则消失且查询落到默认 NXDOMAIN。现在必须在启动
+    /// 期报错退出，并指出规则下标与原因。
+    #[tokio::test]
+    async fn test_init_rejects_prefix_template_rule() {
+        let yaml = "upstreams: []\nrules:\n  - match: \"{1}.lan,ui.{1}.lan\"\n    action:\n      type: rewrite\n      target: \"10.10.0.0\"\n";
+        let config = Config::from_yaml_str(yaml).expect("config parses");
+        let metrics = MetricsRegistry::new();
+        let upstreams = crate::upstream::init(&config, &metrics).await.expect("upstreams init");
+        let err = match init(&config, &metrics, upstreams) {
+            Err(e) => e,
+            Ok(_) => panic!("prefix template must fail startup"),
+        };
+        assert!(err.contains("rules[0]"), "error should name the rule index: {err}");
+        assert!(err.contains("ui.{1}.lan"), "error should quote the bad match: {err}");
+        assert!(
+            err.contains("only suffix templates"),
+            "error should state the constraint: {err}"
+        );
+    }
+
+    /// 回归：`rules:` 段反序列化失败不再静默清空整段规则。
+    #[tokio::test]
+    async fn test_init_rejects_malformed_rules_section() {
+        let yaml = "upstreams: []\nrules: \"not-a-list\"\n";
+        let config = Config::from_yaml_str(yaml).expect("config parses");
+        let metrics = MetricsRegistry::new();
+        let upstreams = crate::upstream::init(&config, &metrics).await.expect("upstreams init");
+        let err = match init(&config, &metrics, upstreams) {
+            Err(e) => e,
+            Ok(_) => panic!("malformed rules section must fail startup"),
+        };
+        assert!(err.contains("invalid `rules` section"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_init_accepts_suffix_template() {
+        let yaml = "upstreams: []\nrules:\n  - match: \"{1}.lan,{1}.ui.lan\"\n    action:\n      type: rewrite\n      target: \"10.10.0.0\"\n";
+        let config = Config::from_yaml_str(yaml).expect("config parses");
+        let metrics = MetricsRegistry::new();
+        let upstreams = crate::upstream::init(&config, &metrics).await.expect("upstreams init");
+        let rules = init(&config, &metrics, upstreams).expect("suffix-only templates are valid");
+        assert_eq!(rules.rules.len(), 1);
     }
 
     #[test]

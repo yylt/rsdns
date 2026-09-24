@@ -511,11 +511,16 @@ fn parse_template(s: &str) -> Result<TemplatePattern, ConfigError>;
 | 形式 | 模板串 | 占位符 | 替换后匹配目标 | 典型用途 |
 |------|--------|--------|----------------|----------|
 | 单占位符 + 字面后缀 | `{1}.example.com` | `{1}` | `<r1>.example.com`（含 example.com 子域） | geoip 国家码、ISP、CDN 节点 |
-| 字面前缀 + 占位符 | `cdn.{1}.com` | `{1}` | `cdn.<r1>.com` | 按客户端解析 cdn 子域 |
 | 多占位符组合 | `{1}.{2}.example.com` | `{1}`,`{2}` | `<r1>.<r2>.example.com` | 地域+运营商 组合 |
-| 占位符在中间 | `{1}.cn.{2}.com` | `{1}`,`{2}` | `<r1>.cn.<r2>.com` | 复合模板 |
 | 纯占位符（无字面 label） | `{1}` | `{1}` | `<r1>`（仅命中该 label 本身） | 单 label 后缀匹配（较少用） |
 | 无占位符 | `example.com` | 无 | 整个域名 | 归入 InlineDomains，不走模板 |
+
+> 2026-09-23 修订：**只支持后缀模板**。`{N}` 必须全部位于字面后缀之前，
+> 因此上表原列的「字面前缀 + 占位符」（`cdn.{1}.com`）与「占位符在中间」
+> （`{1}.cn.{2}.com`）**不再支持**——它们无法用「后缀前第 N 个 label」
+> 的捕获语义表达。这类配置在启动期报配置错误并退出（含规则下标与原因），
+> 不再静默丢弃规则。需要等价效果时写成后缀形式，例如
+> `match: "{1}.ui.lan"`（匹配 `foo.ui.lan` 并捕获 `foo`）。
 
 **约束**：
 
@@ -524,7 +529,8 @@ fn parse_template(s: &str) -> Result<TemplatePattern, ConfigError>;
 3. 字面 label 之间可含 `-`，但 `-` 不能作为标签首字符（沿用域名规则）；
 4. `{N}` 与 `{domain}` 中 `{domain}` 是**示意**（表示“一个真实域名”），不是可替换 token；模板中真正的可替换 token 只有 `{N}`；
 5. 同一规则内 `{N}` 可重复出现（如 `{1}.{1}.example.com`，两个 `{1}` 解析为同一值，同一解析器按 idx 调用，实现需缓存同 idx 结果）；
-6. 模板匹配按替换后的**完整后缀匹配**（子域命中），与 `InlineDomains` 语义一致。
+6. 模板匹配按替换后的**完整后缀匹配**（子域命中），与 `InlineDomains` 语义一致；
+7. `{N}` 之前不得出现任何字面 label（见上方修订说明）。
 
 ### 6.3 解析器注册与匹配流程
 
@@ -568,8 +574,8 @@ for rule in rules {
 - match: "a.com,b.com"
   action: { type: block, response: nxdomain }
 
-# 字面前缀 + 占位符（未来可由 geoip 等插件提供 {1}）
-- match: "cdn.{1}.com"
+# 后缀模板（未来可由 geoip 等插件提供 {1}）：占位符必须在字面后缀之前
+- match: "{1}.cdn.com"
   action: { type: forward, upstream: cdn-pool }
 ```
 

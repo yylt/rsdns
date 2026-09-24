@@ -224,7 +224,10 @@ pub struct RuleConfig {
     /// can be reused in actions like `cname.target`).  Multiple templates
     /// may be comma-separated (`"{1}.a.com,{1}.b.com"`); any one matching
     /// applies the rule.
-    /// Parsed at build time into a `MatchTarget`; invalid syntax is a config error.
+    /// Templates are **suffix-only**: every `{N}` must precede the literal
+    /// domain suffix, so `ui.{1}.lan` / `cdn.{1}.com` are rejected.
+    /// Parsed at build time into a `MatchTarget`; invalid syntax is a config
+    /// error that aborts startup.
     #[serde(default, alias = "r#match")]
     pub r#match: Option<String>,
     /// Optional query-type filter (`"A"`, `"AAAA"`, `"ANY"`, …).

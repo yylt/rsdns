@@ -116,7 +116,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let groups = plugins::groups::init(&config, &metrics);
     let cache = plugins::cache::init(&config, &metrics);
     let upstreams = upstream::init(&config, &metrics).await?;
-    let rules = plugins::rules::init(&config, &metrics, upstreams);
+    let rules = plugins::rules::init(&config, &metrics, upstreams)?;
     let balance = plugins::balance::init(&config);
 
     let pipeline = Pipeline {
