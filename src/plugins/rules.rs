@@ -46,12 +46,12 @@ use std::net::Ipv4Addr;
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 
-use hickory_proto::op::Message;
+use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::rdata::opt::ClientSubnet;
 use hickory_proto::rr::rdata::svcb::{IpHint, SvcParamKey, SvcParamValue};
 use hickory_proto::rr::rdata::{A, CNAME, HTTPS, SVCB};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
-use log::warn;
+use log::{error, warn};
 
 use crate::common::domain_trie::{DomainSuffixTrie, DomainSuffixTrieBuilder};
 
@@ -791,7 +791,7 @@ impl Rules {
                     match self.forward_query(ctx, upstream, opts).await {
                         Ok(()) => Step::Respond,
                         Err(e) => {
-                            warn!("forward {} for {} failed: {}", upstream, ctx.name(), e);
+                            error!("SERVFAIL: upstream resolution failure, domain={} qtype={}: {}", ctx.name(), ctx.qtype(), e);
                             ctx.response = Some(build_servfail(&ctx.msg));
                             ctx.action = format!("forward-error({upstream})");
                             Step::Respond
@@ -832,6 +832,15 @@ impl Rules {
         }
         let resp = self.upstreams.query(upstream, &msg).await?;
         let mut resp = resp;
+        // 上游返回 SERVFAIL rcode：解析失败，标注域名后回退。
+        if resp.metadata.response_code == ResponseCode::ServFail {
+            error!(
+                "SERVFAIL: upstream returned SERVFAIL, domain={} qtype={}",
+                ctx.name(), ctx.qtype()
+            );
+            ctx.response = Some(resp);
+            return Ok(());
+        }
         if opts.resolve_cname {
             self.resolve_cnames(ctx, upstream, &mut resp, opts.subnet).await;
         }
