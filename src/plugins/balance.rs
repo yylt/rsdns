@@ -249,6 +249,19 @@ impl Balance {
         self.cidrs.iter().position(|c| c.contains(ip))
     }
 
+    /// 启动期上游域名解析用：把候选 IP 按本 stage 的 `prefers` CIDR 做**稳定
+    /// 排序**——命中外层（索引更小）CIDR 的 IP 排在前；同排名内保持原有相对顺序
+    /// （Rust `sort_by` 为稳定排序）。家族隔离由 `Cidr::contains` 保证（v4 CIDR
+    /// 只匹配 v4 IP）。未启用（`enabled=false`）或 `cidrs` 为空时为无操作，原样
+    /// 返回。
+    pub fn rank_ips(&self, mut ips: Vec<IpAddr>) -> Vec<IpAddr> {
+        if !self.enabled || self.cidrs.is_empty() {
+            return ips;
+        }
+        ips.sort_by_key(|ip| self.rank(*ip).unwrap_or(usize::MAX));
+        ips
+    }
+
     /// Reorders one family.  When its records have differing ranks the
     /// family is stably prefer-sorted; when they are all equally ranked the
     /// configured mode runs on the family (none → leave as-is, round_robin →
@@ -524,6 +537,47 @@ mod tests {
             ips_of(ctx.response.as_ref().unwrap()),
             vec!["10.0.0.9", "192.0.2.1", "198.51.100.7"]
         );
+    }
+
+    #[test]
+    fn test_rank_ips_stable_prefers() {
+        // rank_ips 与应答排序共享同一份 prefers 语义：命中外层 CIDR 的排在前，
+        // 同排名保持输入顺序（稳定排序），家族隔离（v6 CIDR 不影响 v4 IP）。
+        let cfg = cfg_yaml("balance:\n  prefers:\n    - 192.0.2.0/24\n    - 10.0.0.0/8\nupstreams: []\n");
+        let b = init(&cfg);
+        let ips = vec![
+            IpAddr::from_str("10.0.0.9").unwrap(),
+            IpAddr::from_str("198.51.100.7").unwrap(),
+            IpAddr::from_str("192.0.2.1").unwrap(),
+            IpAddr::from_str("10.1.2.3").unwrap(),
+        ];
+        let ranked = b.rank_ips(ips);
+        // ranks: 192.0.2.1=0, 10.0.0.9/10.1.2.3=1, 198.51.100.7=miss；同 rank 稳定保持顺序。
+        assert_eq!(
+            ranked,
+            vec![
+                IpAddr::from_str("192.0.2.1").unwrap(),
+                IpAddr::from_str("10.0.0.9").unwrap(),
+                IpAddr::from_str("10.1.2.3").unwrap(),
+                IpAddr::from_str("198.51.100.7").unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_rank_ips_noop_without_prefers() {
+        // 未配置 balance（enabled=false）或 prefers 为空 → 原样返回，不影响顺序。
+        let none = init(&cfg_yaml("upstreams: []\n"));
+        assert!(!none.enabled);
+        let ips = vec![
+            IpAddr::from_str("198.51.100.7").unwrap(),
+            IpAddr::from_str("10.0.0.9").unwrap(),
+        ];
+        assert_eq!(none.rank_ips(ips.clone()), ips);
+
+        let empty = init(&cfg_yaml("balance:\n  prefers: []\nupstreams: []\n"));
+        assert!(empty.enabled && empty.cidrs.is_empty());
+        assert_eq!(empty.rank_ips(ips.clone()), ips);
     }
 
     #[test]

@@ -1369,7 +1369,11 @@ mod tests {
         let yaml = "upstreams: []\nrules:\n  - match: \"{1}.lan,ui.{1}.lan\"\n    action:\n      type: rewrite\n      target: \"10.10.0.0\"\n";
         let config = Config::from_yaml_str(yaml).expect("config parses");
         let metrics = MetricsRegistry::new();
-        let upstreams = crate::upstream::init(&config, &metrics).await.expect("upstreams init");
+        let hosts = crate::plugins::hosts::init(&config, &metrics);
+        let balance = crate::plugins::balance::init(&config);
+        let upstreams = crate::upstream::init(&config, &metrics, &hosts, &balance)
+            .await
+            .expect("upstreams init");
         let err = match init(&config, &metrics, upstreams) {
             Err(e) => e,
             Ok(_) => panic!("prefix template must fail startup"),
@@ -1388,7 +1392,11 @@ mod tests {
         let yaml = "upstreams: []\nrules: \"not-a-list\"\n";
         let config = Config::from_yaml_str(yaml).expect("config parses");
         let metrics = MetricsRegistry::new();
-        let upstreams = crate::upstream::init(&config, &metrics).await.expect("upstreams init");
+        let hosts = crate::plugins::hosts::init(&config, &metrics);
+        let balance = crate::plugins::balance::init(&config);
+        let upstreams = crate::upstream::init(&config, &metrics, &hosts, &balance)
+            .await
+            .expect("upstreams init");
         let err = match init(&config, &metrics, upstreams) {
             Err(e) => e,
             Ok(_) => panic!("malformed rules section must fail startup"),
@@ -1401,7 +1409,11 @@ mod tests {
         let yaml = "upstreams: []\nrules:\n  - match: \"{1}.lan,{1}.ui.lan\"\n    action:\n      type: rewrite\n      target: \"10.10.0.0\"\n";
         let config = Config::from_yaml_str(yaml).expect("config parses");
         let metrics = MetricsRegistry::new();
-        let upstreams = crate::upstream::init(&config, &metrics).await.expect("upstreams init");
+        let hosts = crate::plugins::hosts::init(&config, &metrics);
+        let balance = crate::plugins::balance::init(&config);
+        let upstreams = crate::upstream::init(&config, &metrics, &hosts, &balance)
+            .await
+            .expect("upstreams init");
         let rules = init(&config, &metrics, upstreams).expect("suffix-only templates are valid");
         assert_eq!(rules.rules.len(), 1);
     }

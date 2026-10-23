@@ -285,6 +285,22 @@ impl Hosts {
             }
         }
     }
+
+    /// 启动期上游域名解析用：域名在 hosts 中命中**直接 IP 映射**或**别名/CNAME
+    /// （且原域名有 IP 映射）** 时返回静态 IP 列表；未命中、或别名原域名无 IP 时
+    /// 返回 `None`，调用方回退到网络 bootstrap。只取原域名已有的静态 IP，启动期
+    /// 不做链式二次解析。
+    pub fn lookup_static(&self, domain: &str) -> Option<Vec<IpAddr>> {
+        let trie = self.trie.read();
+        match trie.lookup(domain) {
+            Lookup::Ips(ips) => Some(ips.to_vec()),
+            Lookup::Alias(original) => match trie.lookup(original) {
+                Lookup::Ips(ips) => Some(ips.to_vec()),
+                Lookup::Alias(_) | Lookup::Miss => None,
+            },
+            Lookup::Miss => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -372,6 +388,27 @@ mod tests {
         assert_eq!(t.lookup("cdn1.com"), Lookup::Alias("edge.com"));
         assert_eq!(t.lookup("cdn2.com"), Lookup::Alias("edge.com"));
         assert_eq!(t.lookup("cdn3.com"), Lookup::Miss);
+    }
+
+    #[test]
+    fn test_lookup_static() {
+        // 直接 IP 命中、别名（原域名有 IP）、别名（原域名无 IP）、未命中。
+        let h = hosts_stage(test_trie(&[
+            "10.0.0.1 edge.com",
+            "10.0.0.2 cdn1.com",
+            "edge.com alias.com",
+            "lonely.com orphan.com",
+        ]));
+        // 直接 IP 映射。
+        let ips = h.lookup_static("edge.com").expect("direct IP hit");
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))]);
+        // 别名命中：取原域名 IP。
+        let ips = h.lookup_static("alias.com").expect("alias resolves to original IP");
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))]);
+        // 别名但其原域名无 IP 映射 → 回退网络 bootstrap。
+        assert!(h.lookup_static("orphan.com").is_none());
+        // 未命中。
+        assert!(h.lookup_static("nope.com").is_none());
     }
 
     #[test]

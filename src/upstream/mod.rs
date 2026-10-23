@@ -8,7 +8,7 @@
 //! - [`factory`] — protocol-specific connection factories
 //! - [`pool`] — adaptive connection pool
 //! - this module — [`UpstreamClient`], [`UpstreamGroup`], [`Upstreams`]
-//!   and [`init`] (parse → bootstrap resolve → assemble → [`Upstreams`])
+//!   and [`init`] (parse → hosts-first / bootstrap resolve → balance rank → assemble → [`Upstreams`])
 //!
 //! ## Error classification
 //!
@@ -606,87 +606,74 @@ fn classify_upstream(addr: &str) -> &'static str {
 // Bootstrap resolution
 // ---------------------------------------------------------------------------
 
-async fn bootstrap_resolve_all(
+/// Resolves `host` via every bootstrap client, for both A and AAAA,
+/// **concurrently**; the collected A + AAAA addresses (all clients, all
+/// qtypes) are the resolved address set.  Used as the **fallback** when a
+/// domain upstream is not covered by hosts.  Returns an empty set when no
+/// bootstrap client answers.
+async fn resolve_host_all(
     bootstrap_clients: &[UpstreamClient],
-    targets: &[(usize, UpstreamConfig)],
-) -> Vec<(usize, Vec<SocketAddr>)> {
+    host: &str,
+    port: u16,
+    prefer_family: PreferFamily,
+) -> Vec<SocketAddr> {
     use crate::plugins::util::make_query_msg;
     use hickory_proto::rr::{RData, RecordType};
 
-    /// Resolves `host` via every bootstrap client, for both A and AAAA,
-    /// **concurrently**; the collected A + AAAA addresses (all clients, all
-    /// qtypes) are the resolved address set.
-    async fn resolve_host_all(
-        bootstrap_clients: &[UpstreamClient],
-        host: &str,
-        port: u16,
-        prefer_family: PreferFamily,
-    ) -> Vec<SocketAddr> {
-        // Fan out one query per (bootstrap client × qtype) so the wall time
-        // is a single DNS round-trip instead of N×M serial queries.
-        let mut futs: FuturesUnordered<_> = bootstrap_clients
-            .iter()
-            .flat_map(|client| {
-                [RecordType::A, RecordType::AAAA].into_iter().filter_map(move |qtype| {
-                    match prefer_family {
-                        PreferFamily::Ipv4 if qtype != RecordType::A => return None,
-                        PreferFamily::Ipv6 if qtype != RecordType::AAAA => return None,
+    // Fan out one query per (bootstrap client × qtype) so the wall time
+    // is a single DNS round-trip instead of N×M serial queries.
+    let mut futs: FuturesUnordered<_> = bootstrap_clients
+        .iter()
+        .flat_map(|client| {
+            [RecordType::A, RecordType::AAAA].into_iter().filter_map(move |qtype| {
+                match prefer_family {
+                    PreferFamily::Ipv4 if qtype != RecordType::A => return None,
+                    PreferFamily::Ipv6 if qtype != RecordType::AAAA => return None,
+                    _ => {}
+                }
+                let msg = make_query_msg(host, qtype).ok()?;
+                Some((client, qtype, msg))
+            })
+        })
+        .map(|(client, qtype, msg)| async move { (qtype, client.query(&msg).await) })
+        .collect();
+
+    let mut addrs = Vec::new();
+    while let Some((qtype, result)) = futs.next().await {
+        match result {
+            Ok(resp) => {
+                for answer in &resp.answers {
+                    match (qtype, &answer.data) {
+                        (RecordType::A, RData::A(ip)) => {
+                            addrs.push(SocketAddr::new(IpAddr::V4(ip.0), port));
+                        }
+                        (RecordType::AAAA, RData::AAAA(ip)) => {
+                            addrs.push(SocketAddr::new(IpAddr::V6(ip.0), port));
+                        }
                         _ => {}
                     }
-                    let msg = make_query_msg(host, qtype).ok()?;
-                    Some((client, qtype, msg))
-                })
-            })
-            .map(|(client, qtype, msg)| async move { (qtype, client.query(&msg).await) })
-            .collect();
-
-        let mut addrs = Vec::new();
-        while let Some((qtype, result)) = futs.next().await {
-            match result {
-                Ok(resp) => {
-                    for answer in &resp.answers {
-                        match (qtype, &answer.data) {
-                            (RecordType::A, RData::A(ip)) => {
-                                addrs.push(SocketAddr::new(IpAddr::V4(ip.0), port));
-                            }
-                            (RecordType::AAAA, RData::AAAA(ip)) => {
-                                addrs.push(SocketAddr::new(IpAddr::V6(ip.0), port));
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("Bootstrap query failed for {} ({}): {}", host, qtype, e);
                 }
             }
+            Err(e) => {
+                warn!("Bootstrap query failed for {} ({}): {}", host, qtype, e);
+            }
         }
-        addrs.sort_unstable();
-        addrs.dedup();
-        addrs
     }
+    addrs.sort_unstable();
+    addrs.dedup();
+    addrs
+}
 
-    // Resolve all dynamic upstreams concurrently; each target is independent.
-    let results: Vec<_> = targets
-        .iter()
-        .filter_map(|(idx, cfg)| match cfg {
-            UpstreamConfig::NeedResolve {
-                server_name,
-                port,
-                prefer_family,
-                ..
-            } => Some((*idx, server_name.clone(), *port, *prefer_family)),
-            _ => None,
+/// Filters `ips` by address family and turns them into `SocketAddr`s on `port`.
+fn ips_to_addrs(ips: &[IpAddr], port: u16, fam: PreferFamily) -> Vec<SocketAddr> {
+    ips.iter()
+        .filter(|ip| match fam {
+            PreferFamily::Ipv4 => ip.is_ipv4(),
+            PreferFamily::Ipv6 => ip.is_ipv6(),
+            PreferFamily::Any => true,
         })
-        .map(|(idx, host_str, port, prefer_family)| async move {
-            let addrs = resolve_host_all(bootstrap_clients, &host_str, port, prefer_family).await;
-            (idx, addrs)
-        })
-        .collect::<FuturesUnordered<_>>()
+        .map(|ip| SocketAddr::new(*ip, port))
         .collect()
-        .await;
-
-    results
 }
 
 fn build_resolved_pool(cfg: &UpstreamConfig, addrs: Vec<SocketAddr>) -> Arc<ConnectionPool> {
@@ -790,7 +777,12 @@ fn classify_error(e: &io::Error) -> &'static str {
 /// A server whose address is an IP is used directly.  A server whose
 /// address is a domain is resolved through the IP-address servers (the
 /// bootstrap resolvers) and the resolved addresses are used for the pool.
-pub async fn init(config: &Config, registry: &MetricsRegistry) -> Result<Arc<Upstreams>, String> {
+pub async fn init(
+    config: &Config,
+    registry: &MetricsRegistry,
+    hosts: &crate::plugins::hosts::Hosts,
+    balance: &crate::plugins::balance::Balance,
+) -> Result<Arc<Upstreams>, String> {
     let mut all_configs: Vec<UpstreamConfig> = Vec::new();
     let mut upstream_map: Vec<(String, Vec<usize>, QueryModeConfig, Option<CooldownConfig>)> = Vec::new();
 
@@ -837,7 +829,12 @@ pub async fn init(config: &Config, registry: &MetricsRegistry) -> Result<Arc<Ups
         return Err("no IP-address upstream server configured to resolve domain upstreams".into());
     }
 
-    // Phase 2: resolve domain upstreams via the IP-address servers.
+    // Phase 2: resolve domain upstreams.  Per upstream server:
+    //   1) hosts 优先 — 命中 hosts 静态 IP（直接 IP 或别名→原域名 IP）即替换，
+    //      跳过网络 bootstrap；
+    //   2) 网络 bootstrap 兜底 — hosts 未命中、或按 prefer_family 过滤后为空时，
+    //      通过 IP-address 服务器解析；
+    //   3) balance prefers 排序候选 IP（未配置则为无操作）。
     let dynamic_indices: Vec<usize> = all_configs
         .iter()
         .enumerate()
@@ -846,16 +843,41 @@ pub async fn init(config: &Config, registry: &MetricsRegistry) -> Result<Arc<Ups
         .collect();
 
     if !dynamic_indices.is_empty() {
-        info!("resolving {} dynamic upstream(s) via bootstrap...", dynamic_indices.len());
-        let dynamic_entries: Vec<(usize, UpstreamConfig)> =
-            dynamic_indices.iter().map(|&i| (i, all_configs[i].clone())).collect();
-        let resolved = bootstrap_resolve_all(&bootstrap_clients, &dynamic_entries).await;
+        info!("resolving {} dynamic upstream(s)...", dynamic_indices.len());
+        for idx in dynamic_indices {
+            let UpstreamConfig::NeedResolve {
+                server_name,
+                port,
+                prefer_family,
+                ..
+            } = &all_configs[idx]
+            else {
+                unreachable!("dynamic_indices only holds NeedResolve")
+            };
+            let server_name = server_name.clone();
+            let port = *port;
+            let prefer_family = *prefer_family;
 
-        for (idx, addrs) in resolved {
+            // 1) hosts 优先。
+            let mut addrs: Vec<SocketAddr> = hosts
+                .lookup_static(&server_name)
+                .map(|ips| ips_to_addrs(&ips, port, prefer_family))
+                .unwrap_or_default();
+
+            // 2) 网络 bootstrap 兜底（hosts 未命中、或按 prefer_family 过滤后为空）。
             if addrs.is_empty() {
-                return Err(format!("failed to resolve dynamic upstream index={}", idx));
+                addrs = resolve_host_all(&bootstrap_clients, &server_name, port, prefer_family).await;
             }
-            info!("    resolved index={}, addresses {:?}", idx, addrs);
+
+            if addrs.is_empty() {
+                return Err(format!("failed to resolve dynamic upstream '{}'", server_name));
+            }
+
+            // 3) balance prefers 排序候选 IP（按 IP 排序后拼回 port）。
+            let ranked = balance.rank_ips(addrs.iter().map(|a| a.ip()).collect());
+            let addrs: Vec<SocketAddr> = ranked.into_iter().map(|ip| SocketAddr::new(ip, port)).collect();
+
+            info!("    resolved '{}' -> {:?}", server_name, addrs);
             let pool = build_resolved_pool(&all_configs[idx], addrs);
             all_configs[idx] = UpstreamConfig::Pool { pool };
         }
