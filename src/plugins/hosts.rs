@@ -286,21 +286,38 @@ impl Hosts {
         }
     }
 
-    /// 启动期上游域名解析用：域名在 hosts 中命中**直接 IP 映射**或**别名/CNAME
-    /// （且原域名有 IP 映射）** 时返回静态 IP 列表；未命中、或别名原域名无 IP 时
-    /// 返回 `None`，调用方回退到网络 bootstrap。只取原域名已有的静态 IP，启动期
-    /// 不做链式二次解析。
-    pub fn lookup_static(&self, domain: &str) -> Option<Vec<IpAddr>> {
+    /// 启动期上游域名解析用：沿 hosts 的别名/CNAME 链解析一个名称，给出最终去向。
+    ///
+    /// - `Static(ips)`：名称（含别名链末端）命中静态 IP 映射，可直接建池；
+    /// - `Network(name)`：hosts 未命中，或别名链末端无静态 IP —— 调用方应改用
+    ///   `name`（原域名、或别名指向的新名称）走网络 bootstrap 解析。循环别名会被
+    ///   终结为 `Network`。
+    pub fn resolve_host_name(&self, name: &str) -> HostResolution {
         let trie = self.trie.read();
-        match trie.lookup(domain) {
-            Lookup::Ips(ips) => Some(ips.to_vec()),
-            Lookup::Alias(original) => match trie.lookup(original) {
-                Lookup::Ips(ips) => Some(ips.to_vec()),
-                Lookup::Alias(_) | Lookup::Miss => None,
-            },
-            Lookup::Miss => None,
+        let mut cur = name.to_string();
+        let mut visited = std::collections::HashSet::new();
+        loop {
+            if !visited.insert(cur.clone()) {
+                // 循环别名：回退到网络解析当前名，避免死循环。
+                return HostResolution::Network(cur);
+            }
+            match trie.lookup(&cur) {
+                Lookup::Ips(ips) => return HostResolution::Static(ips.to_vec()),
+                Lookup::Alias(original) => cur = original.to_string(),
+                Lookup::Miss => return HostResolution::Network(cur),
+            }
         }
     }
+}
+
+/// `Hosts::resolve_host_name` 的解析结果：静态覆盖、或需要按给定名称走网络解析。
+#[derive(Debug, PartialEq)]
+pub enum HostResolution {
+    /// 完全由 hosts 静态覆盖（直接 IP，或别名链末端是静态 IP）。
+    Static(Vec<IpAddr>),
+    /// 需要网络解析的名称：hosts 未命中，或别名链末端无静态 IP（用此名称走
+    /// 网络 bootstrap，不再使用原始域名）。
+    Network(String),
 }
 
 #[cfg(test)]
@@ -391,24 +408,32 @@ mod tests {
     }
 
     #[test]
-    fn test_lookup_static() {
-        // 直接 IP 命中、别名（原域名有 IP）、别名（原域名无 IP）、未命中。
+    fn test_resolve_host_name() {
+        // 直接 IP、别名→原域名 IP、别名→无 IP（CNAME 新名称走网络）、循环别名、未命中。
         let h = hosts_stage(test_trie(&[
             "10.0.0.1 edge.com",
             "10.0.0.2 cdn1.com",
             "edge.com alias.com",
-            "lonely.com orphan.com",
+            "lonely.com orphan.com", // orphan 无 IP → 改用新名称 orphan.com 走网络
+            "b.com loop.com",
+            "loop.com b.com", // 循环别名 → 回退网络解析
         ]));
         // 直接 IP 映射。
-        let ips = h.lookup_static("edge.com").expect("direct IP hit");
-        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))]);
+        assert_eq!(
+            h.resolve_host_name("edge.com"),
+            HostResolution::Static(vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))])
+        );
         // 别名命中：取原域名 IP。
-        let ips = h.lookup_static("alias.com").expect("alias resolves to original IP");
-        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))]);
-        // 别名但其原域名无 IP 映射 → 回退网络 bootstrap。
-        assert!(h.lookup_static("orphan.com").is_none());
-        // 未命中。
-        assert!(h.lookup_static("nope.com").is_none());
+        assert_eq!(
+            h.resolve_host_name("alias.com"),
+            HostResolution::Static(vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))])
+        );
+        // orphan.com 是 lonely.com 的别名，而 lonely.com 无 IP → 沿别名取新名称 lonely.com 走网络。
+        assert_eq!(h.resolve_host_name("orphan.com"), HostResolution::Network("lonely.com".into()));
+        // 循环别名 → 回退网络解析当前名。
+        assert_eq!(h.resolve_host_name("b.com"), HostResolution::Network("b.com".into()));
+        // 未命中 → 用原名称走网络解析。
+        assert_eq!(h.resolve_host_name("nope.com"), HostResolution::Network("nope.com".into()));
     }
 
     #[test]

@@ -825,15 +825,28 @@ pub async fn init(
         })
         .collect();
     info!("bootstrap clients (IP servers): {}", bootstrap_clients.len());
-    if bootstrap_clients.is_empty() && all_configs.iter().any(UpstreamConfig::needs_resolve) {
-        return Err("no IP-address upstream server configured to resolve domain upstreams".into());
+    // 仅当存在“必须走网络解析、且 hosts 也未覆盖”的域名上游、却又没有 IP 服务器
+    // 时，才报错。hosts 已覆盖（静态 IP 或别名新名称）的上游不消耗 IP 服务器。
+    // 注意：hosts 覆盖情况在 Phase 2 才确定，这里仅做粗判——若最终某个上游既无
+    // hosts 覆盖、网络解析又为空，Phase 2 会给出对应的明确错误。
+    if bootstrap_clients.is_empty() {
+        let needs_network = all_configs.iter().filter(|c| c.needs_resolve()).any(|c| match c {
+            UpstreamConfig::NeedResolve { server_name, .. } => !matches!(
+                hosts.resolve_host_name(server_name),
+                crate::plugins::hosts::HostResolution::Static(_)
+            ),
+            _ => false,
+        });
+        if needs_network {
+            return Err("no IP-address upstream server configured to resolve domain upstreams".into());
+        }
     }
 
     // Phase 2: resolve domain upstreams.  Per upstream server:
-    //   1) hosts 优先 — 命中 hosts 静态 IP（直接 IP 或别名→原域名 IP）即替换，
-    //      跳过网络 bootstrap；
-    //   2) 网络 bootstrap 兜底 — hosts 未命中、或按 prefer_family 过滤后为空时，
-    //      通过 IP-address 服务器解析；
+    //   1) hosts 优先 — 命中静态 IP（直接 IP 或别名链末端 IP）即建池，跳过网络；
+    //      命中别名/CNAME（链末端无静态 IP）时，改用 hosts 指向的“新名称”走网络
+    //      解析（不再用原始域名）；
+    //   2) 网络 bootstrap 兜底 — hosts 未覆盖时，通过 IP-address 服务器解析；
     //   3) balance prefers 排序候选 IP（未配置则为无操作）。
     let dynamic_indices: Vec<usize> = all_configs
         .iter()
@@ -858,14 +871,18 @@ pub async fn init(
             let port = *port;
             let prefer_family = *prefer_family;
 
-            // 1) hosts 优先。
-            let mut addrs: Vec<SocketAddr> = hosts
-                .lookup_static(&server_name)
-                .map(|ips| ips_to_addrs(&ips, port, prefer_family))
-                .unwrap_or_default();
+            // 1) hosts 优先：静态 IP 直接建池；别名/CNAME 取 host 指向的新名称走网络。
+            let resolution = hosts.resolve_host_name(&server_name);
+            let mut addrs: Vec<SocketAddr> = match &resolution {
+                crate::plugins::hosts::HostResolution::Static(ips) => ips_to_addrs(ips, port, prefer_family),
+                crate::plugins::hosts::HostResolution::Network(name) => {
+                    // 别名链指向的新名称（或原始域名未命中 hosts）→ 网络解析。
+                    resolve_host_all(&bootstrap_clients, name, port, prefer_family).await
+                }
+            };
 
-            // 2) 网络 bootstrap 兜底（hosts 未命中、或按 prefer_family 过滤后为空）。
-            if addrs.is_empty() {
+            // 2) 静态命中但按 prefer_family 过滤后为空，回退网络解析（用原域名）。
+            if addrs.is_empty() && matches!(resolution, crate::plugins::hosts::HostResolution::Static(_)) {
                 addrs = resolve_host_all(&bootstrap_clients, &server_name, port, prefer_family).await;
             }
 

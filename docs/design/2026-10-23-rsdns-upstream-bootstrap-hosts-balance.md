@@ -29,11 +29,13 @@ balance `prefers` 对候选 IP 排序**，仍走“非 rules”的 `upstream::in
 
 ### 目标
 
-- `upstream::init` 在 bootstrap 某一个域名上游时，**先查 hosts trie**：若命中
-  直接 IP 映射（`Lookup::Ips`）或命中别名/CNAME（`Lookup::Alias` 且原域名有 IP
-  映射），则用这些 IP（按 `prefer_family` 过滤族）建池，**不再**发网络 bootstrap
-  查询，并打日志 `resolved <host> via hosts -> [..]`。
-- 域名上游解析出的候选 IP（无论来自 hosts 还是网络 bootstrap），在 `init` 建池前
+- `upstream::init` 在 bootstrap 某一个域名上游时，**先查 hosts**：
+  - 命中**静态 IP**（直接 IP 映射，或别名/CNAME 链末端是静态 IP）→ 用这些 IP
+    （按 `prefer_family` 过滤族）建池，**不再**发网络 bootstrap 查询；
+  - 命中**别名/CNAME**（链末端无静态 IP）→ 取 hosts 指向的**新名称**，用该新名称
+    走网络 bootstrap 解析并建池，**不再使用原始域名**；
+  - 未命中 hosts → 用原始域名走网络 bootstrap。
+- 域名上游解析出的候选 IP（无论来自 hosts 静态还是网络 bootstrap），在 `init` 建池前
   **按 `balance:` 的 `prefers` CIDR 列表做稳定排序**（命中外层 CIDR 的排前面；
   IPv4 CIDR 只排 A 记录 IP，IPv6 CIDR 只排 AAAA，家族隔离，与 balance 应答排序
   语义一致）。`prefers` 为空时排序为无操作。
@@ -47,16 +49,21 @@ balance `prefers` 对候选 IP 排序**，仍走“非 rules”的 `upstream::in
   服务器选择——只复用 `prefers` CIDR 排序。
 - 不在 hosts 热重载时重新解析受影响的上游（本提案范围外的后续增强；保持启动期
   一次性解析语义）。
+- 启动期 CNAME 解析不写回 hosts 静态表、不做链式网络递归（沿 hosts 别名链取“新
+  名称”后即走网络解析该名称，最多跟到链末端）。
 
 ### 关于 hosts 命中的范围
 
 `Hosts::handle` 区分 `Lookup::Ips`（直接 IP 映射）与 `Lookup::Alias`（别名/CNAME
-改写：查询别名 → 查原域名 → 取原域名的 IP）。启动期解析上游域名时，**两者都算
-“命中”**：
+改写：查询别名 → 查原域名 → 取原域名的 IP）。启动期用 `Hosts::resolve_host_name`
+沿别名链解析一个上游域名，给出最终去向：
 
-- `Ips`：直接用这些 IP；
-- `Alias`：沿别名取**原域名**的 IP 映射（原域名须有 IP，否则按未命中回退到网络
-  bootstrap）。启动期不做跨文件/链式二次解析，只取原域名已有的静态 IP。
+- `Static(ips)`：名称（含别名链末端）命中静态 IP 映射——直接建池；
+- `Network(name)`：hosts 未命中，或别名链末端无静态 IP——调用方改用 `name`
+  （原始域名、或别名指向的新名称）走网络 bootstrap 解析。循环别名被安全终结。
+
+这与请求期 `handle` 的语义对齐：别名命中且原域名有 IP 时短路；原域名无 IP 时改写
+继续走管线（此处对应“改用新名称走网络”）。
 
 这与请求期 `handle` 的语义一致（alias 命中且原域名有 IP 时即短路），只是不触发
 “原域名无 IP 时改写继续走管线”的分支。
@@ -78,7 +85,7 @@ balance = plugins::balance::init(&config)             // 在 upstream 之后
 - `upstream::init(config, registry)` 当前签名不含 hosts / balance；其 `bootstrap_resolve_all`
   仅通过 IP bootstrap 客户端做网络解析。
 - `Hosts::handle` 暴露 `trie.read().lookup(domain) -> Lookup::{Ips, Alias, Miss}`，
-  但没有一个“取静态 IP 列表”的公开方法。
+  但没有一个“沿别名链解析上游域名、给出最终去向（静态 IP / 走网络的新名称）”的公开方法。
 - `Balance` 持有 `cidrs: Vec<Cidr>` 和 `enabled: bool`，但 `Cidr` 是私有类型，
   没有“给定一批 IP 返回按 prefers 排序后的顺序”的公开方法。
 
@@ -102,26 +109,40 @@ let rules  = plugins::rules::init(&config, &metrics, upstreams)?;
 （这会在 `upstream` → `plugins::{hosts,balance}` 之间新增一条依赖；二者都是启动期
 即装配好、内部以 `Arc` 持有、克隆/共享廉价的类型，耦合可接受。）
 
-### 4.2 `Hosts` 新增公开方法 `lookup_static`
+### 4.2 `Hosts` 新增公开方法 `resolve_host_name`
 
-在 `src/plugins/hosts.rs` 给 `Hosts` 加一个方法：域名命中**直接 IP 映射**
-（`Lookup::Ips`）或**别名/CNAME**（且原域名有 IP 映射，`Lookup::Alias` → 取原域名
-IP）时，返回静态 IP 列表；否则（Miss、或 alias 的原域名无 IP）返回 `None`，调用方
-回退到网络 bootstrap。该方法只取原域名的已有静态 IP，启动期不做链式二次解析：
+在 `src/plugins/hosts.rs` 给 `Hosts` 加一个方法：沿 hosts 别名/CNAME 链解析一个名称，
+给出最终去向（新增 `HostResolution` 枚举）：
+
+- `Static(ips)`：名称（含别名链末端）命中静态 IP 映射——调用方直接建池；
+- `Network(name)`：hosts 未命中，或别名链末端无静态 IP——调用方改用 `name`
+  （原始域名、或别名指向的新名称）走网络 bootstrap 解析。循环别名被安全终结。
 
 ```rust
-/// 启动期上游域名解析用：域名在 hosts 中命中直接 IP 映射或别名（原域名有
-/// IP 映射）时返回静态 IP 列表；未命中、或别名原域名无 IP 时返回 None，
-/// 调用方回退到网络 bootstrap。
-pub fn lookup_static(&self, domain: &str) -> Option<Vec<IpAddr>> {
-    let trie = self.trie.read();
-    match trie.lookup(domain) {
-        Lookup::Ips(ips) => Some(ips.to_vec()),
-        Lookup::Alias(original) => match trie.lookup(original) {
-            Lookup::Ips(ips) => Some(ips.to_vec()),
-            Lookup::Alias(_) | Lookup::Miss => None,
-        },
-        Lookup::Miss => None,
+/// `Hosts::resolve_host_name` 的解析结果：静态覆盖、或需要按给定名称走网络解析。
+pub enum HostResolution {
+    /// 完全由 hosts 静态覆盖（直接 IP，或别名链末端是静态 IP）。
+    Static(Vec<IpAddr>),
+    /// 需要网络解析的名称：hosts 未命中，或别名链末端无静态 IP（用此名称走
+    /// 网络 bootstrap，不再使用原始域名）。
+    Network(String),
+}
+
+impl Hosts {
+    pub fn resolve_host_name(&self, name: &str) -> HostResolution {
+        let trie = self.trie.read();
+        let mut cur = name.to_string();
+        let mut visited = std::collections::HashSet::new();
+        loop {
+            if !visited.insert(cur.clone()) {
+                return HostResolution::Network(cur); // 循环别名 → 回退网络
+            }
+            match trie.lookup(&cur) {
+                Lookup::Ips(ips) => return HostResolution::Static(ips.to_vec()),
+                Lookup::Alias(original) => cur = original.to_string(),
+                Lookup::Miss => return HostResolution::Network(cur),
+            }
+        }
     }
 }
 ```
@@ -175,16 +196,22 @@ Phase 2 主体（替换现有 `bootstrap_resolve_all` 的单一网络路径）�
 ```rust
 for idx in dynamic_indices {
     let UpstreamConfig::NeedResolve { server_name, port, prefer_family, .. } = &all_configs[idx] else { unreachable!() };
+    let server_name = server_name.clone();
+    let port = *port;
+    let prefer_family = *prefer_family;
 
-    // 1) hosts 优先：命中静态 IP 即替换，跳过网络 bootstrap。
-    let mut addrs: Vec<SocketAddr> = hosts.lookup_static(server_name)
-        .map(|ips| ips_to_addrs(&ips, *port, *prefer_family))
-        .unwrap_or_default();
+    // 1) hosts 优先：静态 IP 直接建池；别名/CNAME 取 host 指向的新名称走网络。
+    let resolution = hosts.resolve_host_name(&server_name);
+    let mut addrs: Vec<SocketAddr> = match &resolution {
+        HostResolution::Static(ips) => ips_to_addrs(ips, port, prefer_family),
+        HostResolution::Network(name) => {
+            resolve_host_all(&bootstrap_clients, name, port, prefer_family).await
+        }
+    };
 
-    // 2) 网络 bootstrap 兜底（hosts 未命中、或按 prefer_family 过滤后为空）。
-    if addrs.is_empty() {
-        let net = resolve_host_all(&bootstrap_clients, server_name, *port, *prefer_family).await;
-        addrs = net;
+    // 2) 静态命中但按 prefer_family 过滤后为空，回退网络解析（用原域名）。
+    if addrs.is_empty() && matches!(resolution, HostResolution::Static(_)) {
+        addrs = resolve_host_all(&bootstrap_clients, &server_name, port, prefer_family).await;
     }
 
     if addrs.is_empty() {
@@ -192,9 +219,8 @@ for idx in dynamic_indices {
     }
 
     // 3) balance prefers 排序候选 IP。
-    //    （rank_ips 接收/返回 IP；这里先拆出 IP、排序、再拼回 SocketAddr 的 port。）
     let ranked = balance.rank_ips(addrs.iter().map(|a| a.ip()).collect());
-    let addrs: Vec<SocketAddr> = ranked.into_iter().map(|ip| SocketAddr::new(ip, *port)).collect();
+    let addrs: Vec<SocketAddr> = ranked.into_iter().map(|ip| SocketAddr::new(ip, port)).collect();
 
     info!("    resolved '{}' -> {:?}", server_name, addrs);
     let pool = build_resolved_pool(&all_configs[idx], addrs);
@@ -204,21 +230,25 @@ for idx in dynamic_indices {
 
 说明：
 
-- `resolve_host_all`（原 `bootstrap_resolve_all` 内部函数）保持不变，仅作为兜底；
-  `bootstrap_resolve_all` 可由上述内联逻辑取代，或保留并接收 `hosts`/`balance`
-  参数。为最小改动，倾向于**内联**到 Phase 2，删掉仅网络路径的 `bootstrap_resolve_all`
-  包装，复用其内部的 `resolve_host_all`。
+- `resolve_host_all`（原 `bootstrap_resolve_all` 内部函数）提升为模块级函数，仅作为
+  兜底；`bootstrap_resolve_all` 包装被内联到 Phase 2，复用其内部的 `resolve_host_all`。
+- hosts 命中别名/CNAME（链末端无静态 IP）时，使用 hosts 指向的**新名称**走网络解析，
+  **不再用原始域名**；这正是请求期 `handle` 中“原域名无 IP 时改写继续走管线”在启动
+  期的对应处理。
 - `NeedResolve` 的 `factory` / `raw_pool` / `proto` 经 `build_resolved_pool` 复用，
   建池逻辑不变。
 - 若 `prefer_family` 为 `ipv4`/`ipv6` 且 hosts 给出的 IP 全部为另一族，则 `addrs`
-  为空、回退到网络 bootstrap（行为稳健）。
+  为空、回退到网络 bootstrap（用原始域名，行为稳健）。
+- **放宽“无 IP 上游”启动报错**：当所有域名上游都被 hosts 覆盖（静态 IP 或别名新名称）
+  时，不再强制要求存在 IP 上游；仅在“有上游既无 hosts 覆盖、又无 IP 服务器可网络解析”
+  时才报错。
 
 ## 5. 配置影响
 
 | 位置 | 变更 |
 |------|------|
 | `src/main.rs` | `balance::init` 上移到 `upstream::init` 之前；`upstream::init` 多传 `&hosts`、`&balance` |
-| `src/plugins/hosts.rs` | `Hosts` 新增 `pub fn lookup_static` |
+| `src/plugins/hosts.rs` | `Hosts` 新增 `pub fn resolve_host_name` 与 `HostResolution` 枚举（替代原 `lookup_static`） |
 | `src/plugins/balance.rs` | `Balance` 新增 `pub fn rank_ips` |
 | `src/upstream/mod.rs` | `init` 签名新增 `hosts`/`balance`；Phase 2 改写为 hosts 优先 + balance 排序；`build_resolved_pool` 复用 |
 
@@ -226,8 +256,13 @@ for idx in dynamic_indices {
 
 ## 6. 测试
 
-- **hosts**：`lookup_static` 单测——直接 IP 命中返回 IP 列表；alias 且其原域名有
-  IP 时返回原域名 IP；alias 但原域名无 IP、以及未命中返回 `None`。
+- **hosts**：`resolve_host_name` 单测——直接 IP 命中返回 `Static`；alias 且原域名有
+  IP 返回 `Static`（原域名 IP）；alias 但原域名无 IP 返回 `Network`(新名称)；循环
+  别名、未命中返回 `Network`(当前名)。
+- **upstream**：`init` 集成测试——配置一个**域名** doh/dot 上游，并在 `hosts:` 中
+  用 **CNAME 别名**（别名原域名无 IP）指向另一个域名；断言 `init` 不依赖 IP bootstrap
+  客户端、改用 hosts 指向的新名称走网络解析即可完成（无 IP 上游、仅 hosts 覆盖也能
+  成功），验证“CNAME→新名称解析”路径。
 - **balance**：`rank_ips` 单测——给一组混合 v4/v6 IP 与 `prefers` CIDR，断言稳定
   排序结果（命中 CIDR 的在前、同排名保持顺序）；`enabled=false` / `cidrs` 为空时
   原样返回。
