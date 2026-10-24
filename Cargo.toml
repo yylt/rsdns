@@ -76,6 +76,8 @@ lto = true
 strip = true
 debug-assertions = false
 codegen-units = 1
+panic = "abort"
+overflow-checks = false
 
 [profile.release-with-symbols]
 inherits = "release"
