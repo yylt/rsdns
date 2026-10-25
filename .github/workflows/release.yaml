@@ -15,25 +15,40 @@ jobs:
   build:
     name: Build - ${{ matrix.platform.name }}
     runs-on: ubuntu-latest
+    # Build inside Debian 12 so the binaries link against glibc 2.36.
+    # ubuntu-latest (24.04) ships glibc 2.39, which would make gnu binaries
+    # require a newer libc than Debian 12 provides.
+    container:
+      image: debian:12
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      # glibc uses 4k pages on both x86_64 and aarch64 (Debian 12 default)
+      JEMALLOC_SYS_WITH_LG_PAGE: "12"
     strategy:
       fail-fast: false
       matrix:
         platform:
           - name: Linux x86_64
-            target: x86_64-unknown-linux-musl
-            builder: cargo
+            target: x86_64-unknown-linux-gnu
             artifact-dir: release
             build-args: "--release"
 
           - name: Linux aarch64
-            target: aarch64-unknown-linux-musl
-            builder: cross
+            target: aarch64-unknown-linux-gnu
             artifact-dir: release
             build-args: "--release -vv"
 
     steps:
       - name: Checkout Git repo
         uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            curl ca-certificates git \
+            build-essential pkg-config cmake \
+            gcc-aarch64-linux-gnu libc6-dev-arm64-cross
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -42,29 +57,15 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install musl-tools
-        if: matrix.platform.builder == 'cargo'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools pkg-config
-
-      - name: Install cross
-        if: matrix.platform.builder == 'cross'
-        run: cargo install cross --git https://github.com/cross-rs/cross
-
-      - name: Build with cargo
-        if: matrix.platform.builder == 'cargo'
+      - name: Build
         env:
-          JEMALLOC_SYS_WITH_LG_PAGE: ${{ contains(matrix.platform.target, 'aarch64') && '14' || '12' }}
+          # cross-compile aarch64 against Debian 12's arm64 glibc (2.36)
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
         run: |
           cargo build ${{ matrix.platform.build-args }} --bin ${{ env.BIN_NAME }} --target ${{ matrix.platform.target }}
-
-      - name: Build with cross
-        if: matrix.platform.builder == 'cross'
-        env:
-          JEMALLOC_SYS_WITH_LG_PAGE: ${{ contains(matrix.platform.target, 'aarch64') && '14' || '12' }}
-        run: |
-          cross build ${{ matrix.platform.build-args }} --bin ${{ env.BIN_NAME }} --target ${{ matrix.platform.target }}
 
       - name: Package release artifacts
         run: |
