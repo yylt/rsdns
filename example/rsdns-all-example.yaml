@@ -96,6 +96,10 @@ cache:
   min_ttl: 60                      # clamp TTL lower bound (seconds)
   max_ttl: 3600                    # clamp TTL upper bound (seconds)
   keep_ttl: false                  # global default: clamp TTL
+  skip_balance: true               # on cache hit, skip balance re-reordering
+                                   # (true: serve order frozen at write-back;
+                                   #  false: re-run prefers/mode/max_answers
+                                   #  on every hit using the current config)
 
 # Hosts: suffix-matched static IP mapping (supports file: prefix and wildcard).
 # Two line formats:

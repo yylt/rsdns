@@ -247,12 +247,20 @@ pub fn init(config: &Config, registry: &MetricsRegistry) -> Cache {
     );
     let metrics = CacheMetrics::register(registry);
     cache.attach_metrics(metrics);
-    Cache { cache }
+    Cache {
+        cache,
+        skip_balance_on_hit: cfg.skip_balance.unwrap_or(true),
+    }
 }
 
 /// The cache stage.
 pub struct Cache {
     cache: DnsCache,
+    /// Whether a cache hit skips the `balance` post-pass.  Comes from the
+    /// `cache.skip_balance` config (default `true`); when `false`, the
+    /// cached response is rebalanced on every hit instead of serving the
+    /// order frozen at write-back time.
+    skip_balance_on_hit: bool,
 }
 
 impl Cache {
@@ -266,9 +274,11 @@ impl Cache {
 
         match self.cache.get_cached(&ctx.key).await {
             CacheResult::Fresh(entry) => {
-                // 缓存命中：顺序在写回时已被 balance 排定，跳过 balance
-                // 阶段重复处理（缓存同一 TTL 内各客户端拿到一致顺序）。
-                ctx.skip_balance = true;
+                // 缓存命中：写回时顺序已被 balance 排定（默认）；按
+                // `cache.skip_balance` 决定是否在命中时跳过重排。
+                // 默认 true：同一 TTL 内各客户端拿到一致顺序；false 则每次
+                // 命中都重新跑 prefers/mode/max_answers。
+                ctx.skip_balance = self.skip_balance_on_hit;
                 let action = entry.action_name();
                 match build_response_from_cache(&ctx.msg, &entry, self.cache.keep_ttl) {
                     Ok(resp) => {
@@ -312,7 +322,10 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
     use std::time::Duration;
+
+    use serde_yaml;
 
     #[tokio::test]
     async fn test_cache_fresh() {
@@ -421,5 +434,71 @@ mod tests {
         } else {
             panic!("expected Fresh");
         }
+    }
+
+    /// Builds a minimal `Cache` stage with the given `skip_balance_on_hit`,
+    /// populated with a single A record under `key`.
+    async fn cached_stage(skip_balance_on_hit: bool) -> Cache {
+        let inner = DnsCache::new_metric(10, 0, 3600, false);
+        inner
+            .put(
+                CacheKey::new("hit.test", RecordType::A),
+                vec![CacheRecord::A(Ipv4Addr::new(1, 2, 3, 4))],
+                300,
+            )
+            .await;
+        Cache {
+            cache: inner,
+            skip_balance_on_hit,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cache_hit_skip_balance_default_true() {
+        // 默认（未配置 / true）：命中后 ctx.skip_balance = true。
+        let stage = cached_stage(true).await;
+        let mut ctx = QueryContext::new(
+            crate::plugins::util::make_query_msg("hit.test", RecordType::A).unwrap(),
+            CacheKey::new("hit.test", RecordType::A),
+            std::net::SocketAddr::from_str("127.0.0.1:5353").unwrap(),
+            "udp",
+            Instant::now(),
+            0,
+        );
+        let step = stage.lookup(&mut ctx).await;
+        assert!(step.is_respond());
+        assert!(ctx.skip_balance, "default hit must skip balance re-reorder");
+    }
+
+    #[tokio::test]
+    async fn test_cache_hit_skip_balance_false_reorders() {
+        // 配置 false：命中后 ctx.skip_balance = false，交由 balance 阶段重排。
+        let stage = cached_stage(false).await;
+        let mut ctx = QueryContext::new(
+            crate::plugins::util::make_query_msg("hit.test", RecordType::A).unwrap(),
+            CacheKey::new("hit.test", RecordType::A),
+            std::net::SocketAddr::from_str("127.0.0.1:5353").unwrap(),
+            "udp",
+            Instant::now(),
+            0,
+        );
+        let step = stage.lookup(&mut ctx).await;
+        assert!(step.is_respond());
+        assert!(!ctx.skip_balance, "hit with skip_balance=false must rebalance");
+    }
+
+    #[test]
+    fn test_cache_config_skip_balance_default_and_explicit() {
+        // cache.skip_balance: false → 解析为 Some(false)；缺省 → None（阶段内
+        // 回落为 true）。避开 init 的重复指标注册，直接解析 CacheConfig。
+        let cfg_off = Config::from_yaml_str("cache:\n  skip_balance: false\nupstreams: []\n").unwrap();
+        let raw_off = cfg_off.plugin_sections.get("cache").cloned().unwrap_or_default();
+        let off: CacheConfig = serde_yaml::from_value(raw_off).unwrap();
+        assert_eq!(off.skip_balance, Some(false));
+
+        let cfg_def = Config::from_yaml_str("upstreams: []\n").unwrap();
+        let raw_def = cfg_def.plugin_sections.get("cache").cloned().unwrap_or_default();
+        let def: CacheConfig = serde_yaml::from_value(raw_def).unwrap();
+        assert_eq!(def.skip_balance, None);
     }
 }

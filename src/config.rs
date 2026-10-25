@@ -100,6 +100,14 @@ pub struct CacheConfig {
     /// If `true`, preserve the upstream's original TTL (overrides `min_ttl`/`max_ttl`).
     #[serde(default)]
     pub keep_ttl: Option<bool>,
+    /// On a cache hit, whether to skip the `balance` stage's reordering of
+    /// the cached response.  Default `true`: the order was already frozen at
+    /// write-back time (after the first upstream response was balanced), so
+    /// rebalancing is skipped to keep every client's view consistent within a
+    /// TTL.  Set to `false` to re-run `prefers` / `mode` / `max_answers` on
+    /// every cache hit instead of serving the stored order.
+    #[serde(default)]
+    pub skip_balance: Option<bool>,
 }
 
 /// Balance plugin configuration (top-level `balance:` section).
