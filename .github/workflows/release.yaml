@@ -41,6 +41,13 @@ jobs:
     steps:
       - name: Checkout Git repo
         uses: actions/checkout@v4
+        with:
+          # Full history + tags so `git describe --tags` yields the version
+          # (e.g. v0.1.4) instead of falling back to a commit hash. `build.rs`
+          # also reads the version from git, and the binary is compiled here
+          # (not in the `release` job), so tags must be available at build time.
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Install build dependencies
         run: |
