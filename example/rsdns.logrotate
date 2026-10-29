@@ -1,0 +1,32 @@
+# Example logrotate configuration for rsdns query logs.
+#
+# rsdns writes query logs to `{log.directory}/query.log` and never rotates
+# them itself: rotation/compression/retention are entirely owned by
+# logrotate.  After renaming the file, logrotate must tell rsdns to reopen
+# it (`systemctl reload rsdns` → SIGHUP), otherwise rsdns keeps writing to
+# the already-renamed inode.
+#
+# `log.directory` must be a plain directory path, e.g.:
+#
+#   log:
+#     directory: '/var/log/rsdns'
+#
+# Install:
+#   sudo cp example/rsdns.logrotate /etc/logrotate.d/rsdns
+#
+# Note: rsdns's `log.directory` only controls where query logs go; use the
+# `rotate` / `maxsize` / `daily` directives below for retention.
+
+/var/log/rsdns/query.log {
+    daily
+    rotate 14
+    maxsize 50M
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root root
+    postrotate
+        systemctl reload rsdns >/dev/null 2>&1 || true
+    endscript
+}

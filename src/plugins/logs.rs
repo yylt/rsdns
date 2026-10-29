@@ -5,32 +5,27 @@
 //! `ctx.skip_log` was set by a downstream stage.
 //!
 //! Lines go either to stdout (async, buffered as `bytes::Bytes`) or, when
-//! `log.directory` is set (`{dir}:{maxsize}:{numfile}`), to a rotating file
-//! `dir/query.log`: once the active file reaches `maxsize` it is gzip
-//! archived as `query.log.N.gz` (N monotonically increasing, existing
-//! archives are never renamed) and a fresh file continues; at most
-//! `numfile` files (active + archives) are kept — the oldest (lowest-N)
-//! archives are pruned.  Directory-mode I/O runs
-//! through `tokio::fs` (never blocking a worker); gzip compression, being
-//! a synchronous `flate2` API, runs in `spawn_blocking`.
+//! `log.directory` is set (a plain directory path), appended to
+//! `dir/query.log`.  rsdns never rotates or compresses that file itself:
+//! rotation is owned by an external `logrotate` (see
+//! `example/rsdns.logrotate`), which renames the file and then has the
+//! process reopen it via `SIGHUP` (`systemctl reload rsdns` →
+//! [`QueryLogger::reopen`]).  Directory-mode I/O runs through `tokio::fs`
+//! (never blocking a worker).
 
 use bytes::{BufMut, Bytes, BytesMut};
-use flate2::write::GzEncoder;
-use flate2::Compression;
 use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::RecordType;
 use std::fmt::Write as _;
-use std::io::{self, SeekFrom};
+use std::io;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 use tokio::fs;
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
-use crate::config::{
-    default_log_directory, parse_log_directory_checked, Config, LogConfig, LogDirectory, DEFAULT_LOG_DIRECTORY,
-};
+use crate::config::{Config, LogConfig};
 use crate::metrics::{Counter, MetricsRegistry};
 use crate::query::QueryContext;
 
@@ -230,31 +225,35 @@ fn format_rcode(rcode: ResponseCode) -> &'static str {
     }
 }
 
-/// 查询日志：预编译模板 + 写出（stdout 或轮转目录文件）。
+/// 查询日志：预编译模板 + 写出（stdout 或目录文件）。
 ///
 /// 每次查询渲染一行 `Bytes` 后写出。目录模式行级写入 `tokio::fs` 写入器
 /// （异步，不阻塞 worker），stdout 模式走 tokio 异步写出。
 pub(crate) struct QueryLogger {
     template: CompiledTemplate,
-    sink: Arc<LogSink>,
+    sink: LogSink,
 }
 
 impl QueryLogger {
-    /// 构建 logger。目录模式下创建目录并打开初始文件，失败返回 Err
-    /// （启动报错退出）；`directory` 解析失败记 warning 并按默认目录处理。
+    /// 构建 logger。目录模式下创建目录并打开（或创建）`dir/query.log`，
+    /// 失败返回 Err（启动报错退出）。`directory` 必须是纯目录路径：内置
+    /// 轮转已移除，旧的 `{dir}:{maxsize}:{numfile}` 形式直接报错。
     pub async fn new(cfg: &LogConfig) -> Result<Arc<Self>, io::Error> {
         let sink = match cfg.directory.as_deref() {
-            Some(spec) => {
-                let ld = match parse_log_directory_checked(spec) {
-                    Some(ld) => ld,
-                    None => {
-                        log::warn!("invalid log.directory {:?}; using default {:?}", spec, DEFAULT_LOG_DIRECTORY);
-                        default_log_directory()
-                    }
-                };
-                Arc::new(LogSink::Directory(tokio::sync::Mutex::new(RotatingFileSink::open(ld).await?)))
+            Some(dir) => {
+                if dir.contains(':') {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "log.directory {dir:?} must be a plain directory path: built-in rotation was removed, \
+                             use an external logrotate (see example/rsdns.logrotate) and set \
+                             `directory: /var/log/rsdns`"
+                        ),
+                    ));
+                }
+                LogSink::Directory(DirectorySink::open(PathBuf::from(dir)).await?)
             }
-            None => Arc::new(LogSink::Stdout(tokio::sync::Mutex::new(tokio::io::stdout()))),
+            None => LogSink::Stdout(tokio::sync::Mutex::new(tokio::io::stdout())),
         };
         Ok(Arc::new(Self {
             template: compile_template(&cfg.format),
@@ -264,14 +263,25 @@ impl QueryLogger {
 
     pub async fn write(&self, qlog: &QueryLog<'_>) {
         let line = qlog.format(&self.template);
-        match &*self.sink {
+        match &self.sink {
             LogSink::Stdout(stdout) => {
                 let mut stdout = stdout.lock().await;
                 if let Err(e) = stdout.write_all(&line).await {
                     log::warn!("query log write failed: {}", e);
                 }
             }
-            LogSink::Directory(sink) => sink.lock().await.write(&line).await,
+            LogSink::Directory(sink) => sink.write(&line).await,
+        }
+    }
+
+    /// 重新打开目录模式下的 `query.log`（`SIGHUP` 触发）。stdout 模式为空操作。
+    ///
+    /// `logrotate` 用 rename + create 轮转文件后，进程必须换掉旧文件描述符，
+    /// 否则后续日志继续写进已重命名/已压缩的旧 inode。
+    pub async fn reopen(&self) -> io::Result<()> {
+        match &self.sink {
+            LogSink::Stdout(_) => Ok(()),
+            LogSink::Directory(sink) => sink.reopen().await,
         }
     }
 }
@@ -280,154 +290,56 @@ impl QueryLogger {
 enum LogSink {
     /// stdout（默认），句柄启动时创建一次并复用。
     Stdout(tokio::sync::Mutex<tokio::io::Stdout>),
-    /// 轮转目录文件：`dir/query.log` + gzip 归档（行级写入短临界区，压缩
-    /// 在 `spawn_blocking` 中执行，不阻塞 tokio worker）。
-    Directory(tokio::sync::Mutex<RotatingFileSink>),
+    /// 目录文件：`dir/query.log`，追加写入，轮转交给外部 `logrotate`。
+    Directory(DirectorySink),
 }
 
-/// 轮转文件写入器：单行追加 + 大小累计 + 轮转（gzip 归档 / 顺次编号 /
-/// 超限删除）。所有文件操作走 `tokio::fs`（异步），由调用方确保互斥。
-struct RotatingFileSink {
+/// 目录文件写入器：单行追加 + 可重开。
+///
+/// 互斥用 `tokio::sync::Mutex` 只保护文件句柄，`reopen` 的新句柄在拿锁之前
+/// 就打开好，锁内只做一次替换。
+struct DirectorySink {
+    /// 日志目录（保持不变，重开时复用）。
     dir: PathBuf,
-    maxsize: u64,
-    numfile: usize,
-    file: fs::File,
-    written: u64,
-    /// 下一个归档编号（每次轮转递增，不重命名已有归档）。
-    next: u64,
+    /// 当前 `dir/query.log` 句柄。
+    file: tokio::sync::Mutex<fs::File>,
 }
 
-impl RotatingFileSink {
-    /// 打开 `dir` 下的轮转日志：创建目录，以追加模式打开/创建 `query.log`
-    /// 并回退到文件末尾累计已写字节（启动恢复计数）；归档编号从现有归档的
-    /// 最大编号 +1 继续（沿用历史归档，不重命名）。
-    async fn open(spec: LogDirectory) -> io::Result<Self> {
-        let dir = PathBuf::from(&spec.dir);
-        fs::create_dir_all(&dir).await?;
-        let path = dir.join("query.log");
-        let mut file = fs::OpenOptions::new().create(true).append(true).open(&path).await?;
-        let written = file.seek(SeekFrom::End(0)).await?;
-        let next = max_archive_index(&dir).await + 1;
+impl DirectorySink {
+    /// 创建目录并以追加模式打开/创建 `dir/query.log`。
+    async fn open(dir: PathBuf) -> io::Result<Self> {
+        let file = open_query_log(&dir).await?;
         Ok(Self {
             dir,
-            maxsize: spec.maxsize,
-            numfile: spec.numfile,
-            file,
-            written,
-            next,
+            file: tokio::sync::Mutex::new(file),
         })
     }
 
-    /// 追加一行；若已有内容且写满阈值则先轮转再写（空文件不轮转，避免
-    /// 产生空归档）。
-    async fn write(&mut self, line: &[u8]) {
-        if self.written > 0 && self.written + line.len() as u64 > self.maxsize {
-            self.rotate().await;
-        }
-        match self.file.write_all(line).await {
-            Ok(()) => self.written += line.len() as u64,
-            Err(e) => log::error!("query log write failed: {}", e),
+    /// 追加一行；写失败仅记 error（不中断服务）。
+    async fn write(&self, line: &[u8]) {
+        let mut file = self.file.lock().await;
+        if let Err(e) = file.write_all(line).await {
+            log::error!("query log write failed: {}", e);
         }
     }
 
-    /// 轮转：把当前 `query.log` 整体 gzip 为 `query.log.{next}.gz`
-    /// （`spawn_blocking` 中流式压缩），原文件截断继续追加；归档编号每次
-    /// 递增，已有归档不重命名，仅删除超限的最旧归档。失败仅记 error，
-    /// 不中断服务。
-    async fn rotate(&mut self) {
-        let src = self.dir.join("query.log");
-        let dst = self.dir.join(format!("query.log.{}.gz", self.next));
-        if let Err(e) = self.file.flush().await {
-            log::error!("query log flush before rotate failed: {}", e);
-        }
-        match gzip_file(&src, &dst).await {
-            Ok(()) => {
-                // 归档成功后再截断原文件；截断失败时下轮再试（文件仍可追加）。
-                if let Err(e) = self.file.set_len(0).await {
-                    log::error!("query log truncate after rotate failed: {}", e);
-                    return;
-                }
-                if let Err(e) = self.file.seek(SeekFrom::Start(0)).await {
-                    log::error!("query log rewind after rotate failed: {}", e);
-                }
-                self.written = 0;
-                self.next += 1;
-                self.prune().await;
-            }
-            Err(e) => log::error!("query log rotate failed: {}", e),
-        }
-    }
-
-    /// 删除超限的最旧归档：只保留编号最大的 `numfile-1` 个归档（当前
-    /// `query.log` 不计入）；已有归档不重命名、不挪位。任一文件失败仅记
-    /// warning，继续处理其余。
-    async fn prune(&self) {
-        let keep = (self.numfile - 1) as u64;
-        let mut archives = collect_archives(&self.dir).await;
-        archives.sort_unstable();
-        // 删除最旧的（编号最小）直到不超过 `keep` 个。
-        while archives.len() > keep as usize {
-            let idx = archives.remove(0);
-            let from = self.dir.join(format!("query.log.{idx}.gz"));
-            if let Err(e) = fs::remove_file(&from).await {
-                log::warn!("query log: remove old archive {:?}: {}", from, e);
-            }
-        }
-    }
-}
-
-/// 流式 gzip 压缩 `src` 到 `dst`（边读边压，不整体载入内存）。`flate2` 为
-/// 同步 API，在 `spawn_blocking` 中执行，避免阻塞 tokio worker。
-async fn gzip_file(src: &Path, dst: &Path) -> io::Result<()> {
-    let src = src.to_path_buf();
-    let dst = dst.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let mut input = std::fs::File::open(src)?;
-        let mut encoder = GzEncoder::new(std::fs::File::create(dst)?, Compression::default());
-        io::copy(&mut input, &mut encoder)?;
-        encoder.finish()?;
+    /// 重新打开 `dir/query.log`：先打开新句柄（失败时旧句柄保持不动，返回
+    /// Err），成功后再取锁替换。
+    async fn reopen(&self) -> io::Result<()> {
+        let file = open_query_log(&self.dir).await?;
+        *self.file.lock().await = file;
         Ok(())
-    })
-    .await
-    .map_err(io::Error::other)? // JoinError → io::Error
-}
-
-/// 从归档文件名解析编号：`query.log.N.gz` → `Some(N)`。
-fn archive_index(name: &std::ffi::OsStr) -> Option<u64> {
-    let s = name.to_str()?;
-    let rest = s.strip_prefix("query.log.")?;
-    let n = rest.strip_suffix(".gz")?;
-    n.parse::<u64>().ok()
-}
-
-/// 列出 `dir` 下所有归档编号；`read_dir` 失败时记 warning 并返回空列表。
-async fn collect_archives(dir: &Path) -> Vec<u64> {
-    let mut entries = match fs::read_dir(dir).await {
-        Ok(entries) => entries,
-        Err(e) => {
-            log::warn!("query log: read_dir {:?}: {}", dir, e);
-            return Vec::new();
-        }
-    };
-    let mut idxs = Vec::new();
-    while let Some(entry) = entries.next_entry().await.transpose() {
-        match entry {
-            Ok(entry) => {
-                if let Some(idx) = archive_index(&entry.file_name()) {
-                    idxs.push(idx);
-                }
-            }
-            Err(e) => log::warn!("query log: read_dir {:?}: {}", dir, e),
-        }
     }
-    idxs
 }
 
-/// 现有归档的最大编号；无归档时返回 0（供 `open` 从 1 开始编号）。
-async fn max_archive_index(dir: &Path) -> u64 {
-    let mut archives = collect_archives(dir).await;
-    archives.sort_unstable();
-    archives.pop().unwrap_or(0)
+/// 以追加模式打开（或创建）`dir/query.log`，目录不存在时递归创建。
+async fn open_query_log(dir: &Path) -> io::Result<fs::File> {
+    fs::create_dir_all(dir).await?;
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("query.log"))
+        .await
 }
 
 /// 将应答中的记录类型列表写入 `out`（逗号分隔），空应答写 `-`。
@@ -486,6 +398,12 @@ pub async fn init(config: &Config, registry: &MetricsRegistry) -> Result<Logs, i
 impl Logs {
     /// No-op retained for API stability: lines are written immediately.
     pub async fn flush(&self) {}
+
+    /// 重新打开查询日志文件（`SIGHUP` / `systemctl reload`），配合外部
+    /// `logrotate` 的 rename + create 轮转。stdout 模式为空操作。
+    pub async fn reopen(&self) -> io::Result<()> {
+        self.logger.reopen().await
+    }
 
     /// Writes the query log line after the pipeline completed, unless
     /// `ctx.skip_log` was set by a downstream stage.
@@ -662,7 +580,7 @@ mod tests {
         assert!(off.as_bytes().iter().all(u8::is_ascii_digit), "rendered: {rendered:?}");
     }
 
-    // -- rotation ---------------------------------------------------------
+    // -- directory file sink ----------------------------------------------
 
     fn tmp_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("rsdns-logtest-{tag}-{}", std::process::id()));
@@ -670,153 +588,93 @@ mod tests {
         dir
     }
 
+    /// 目录模式：多次写入按顺序追加到 `dir/query.log`，不产生归档。
     #[tokio::test]
-    async fn test_rotate_archives_and_truncates() {
-        let dir = tmp_dir("rotate");
-        let mut sink = RotatingFileSink::open(LogDirectory {
-            dir: dir.to_string_lossy().into_owned(),
-            maxsize: 8,
-            numfile: 5,
-        })
-        .await
-        .unwrap();
+    async fn test_directory_sink_appends_lines() {
+        let dir = tmp_dir("append");
+        let sink = DirectorySink::open(dir.clone()).await.unwrap();
 
-        // 两行各 8 字节：第一行写满 8 字节不轮转，第二行触发轮转。
-        sink.write(b"aaaaaaaa").await;
-        assert!(dir.join("query.log").exists());
-        assert!(!dir.join("query.log.1.gz").exists(), "未超限不轮转");
+        sink.write(b"first\n").await;
+        sink.write(b"second\n").await;
+        sink.file.lock().await.flush().await.unwrap();
 
-        sink.write(b"bbbbbbbb").await;
-        assert!(dir.join("query.log.1.gz").exists(), "超限后产生归档");
-        // 写入仅拷贝进缓冲即返回，落盘是异步的；先 flush 再读，避免读到
-        // set_len(0) 之后、本行落盘之前的空文件。
-        sink.file.flush().await.unwrap();
-        assert_eq!(std::fs::read_to_string(dir.join("query.log")).unwrap(), "bbbbbbbb");
-        assert_eq!(sink.written, 8);
-
-        // 归档内容与轮转前文件一致（gzip 解压后）。
-        let mut gz = flate2::read::GzDecoder::new(std::fs::File::open(dir.join("query.log.1.gz")).unwrap());
-        let mut content = String::new();
-        use std::io::Read;
-        gz.read_to_string(&mut content).unwrap();
-        assert_eq!(content, "aaaaaaaa");
-
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_rotate_numbers_monotonically_without_renaming() {
-        let dir = tmp_dir("monotonic");
-        let mut sink = RotatingFileSink::open(LogDirectory {
-            dir: dir.to_string_lossy().into_owned(),
-            maxsize: 4,
-            numfile: 5,
-        })
-        .await
-        .unwrap();
-
-        // 3 个轮转周期，每个 4 字节行；归档编号应顺次为 1、2、3，且已有
-        // 归档不被重命名（1.gz 始终是 1.gz）。
-        sink.write(b"aaaa").await;
-        sink.write(b"bbbb").await;
-        sink.write(b"cccc").await;
-        sink.write(b"dddd").await;
-        assert!(dir.join("query.log.1.gz").exists());
-        assert!(dir.join("query.log.2.gz").exists());
-        assert!(dir.join("query.log.3.gz").exists());
-
-        // 1.gz 内容是最早的归档，未被挪位。
-        let mut gz = flate2::read::GzDecoder::new(std::fs::File::open(dir.join("query.log.1.gz")).unwrap());
-        let mut content = String::new();
-        use std::io::Read;
-        gz.read_to_string(&mut content).unwrap();
-        assert_eq!(content, "aaaa");
-
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_rotate_keeps_numfile_archives() {
-        let dir = tmp_dir("numfile");
-        let mut sink = RotatingFileSink::open(LogDirectory {
-            dir: dir.to_string_lossy().into_owned(),
-            maxsize: 4,
-            numfile: 3,
-        })
-        .await
-        .unwrap();
-
-        // 4 个归档周期 + 收尾写入；共应保留 query.log + 2 个 .gz（编号最大
-        // 的两个：3、4），最旧的 1、2 号归档被删除。
-        sink.write(b"aaaa").await;
-        sink.write(b"bbbb").await;
-        sink.write(b"cccc").await;
-        sink.write(b"dddd").await;
-        sink.write(b"ee").await;
-        assert_eq!(sink.written, 2);
-
-        assert!(!dir.join("query.log.1.gz").exists(), "最旧归档被删除");
-        assert!(!dir.join("query.log.2.gz").exists(), "最旧归档被删除");
-        assert!(dir.join("query.log.3.gz").exists());
-        assert!(dir.join("query.log.4.gz").exists());
-
-        // 保留下来的归档内容正确（3 号 = "cccc"，4 号 = "dddd"）。
-        let mut gz = flate2::read::GzDecoder::new(std::fs::File::open(dir.join("query.log.3.gz")).unwrap());
-        let mut content = String::new();
-        use std::io::Read;
-        gz.read_to_string(&mut content).unwrap();
-        assert_eq!(content, "cccc");
-        let mut gz = flate2::read::GzDecoder::new(std::fs::File::open(dir.join("query.log.4.gz")).unwrap());
-        let mut content4 = String::new();
-        gz.read_to_string(&mut content4).unwrap();
-        assert_eq!(content4, "dddd");
-
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_open_resumes_after_existing_archives() {
-        let dir = tmp_dir("resume");
-        // 预置两个归档 1.gz、3.gz（模拟历史归档）；下次编号应从最大编号 +1
-        // 即 4 开始，且已有归档不被重命名。
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("query.log.1.gz"), b"old1").unwrap();
-        std::fs::write(dir.join("query.log.3.gz"), b"old3").unwrap();
-
-        let mut sink = RotatingFileSink::open(LogDirectory {
-            dir: dir.to_string_lossy().into_owned(),
-            maxsize: 2,
-            numfile: 5,
-        })
-        .await
-        .unwrap();
-        assert_eq!(sink.next, 4, "编号从现有最大编号 +1 继续");
-
-        sink.write(b"aa").await;
-        sink.write(b"bb").await;
-        assert!(dir.join("query.log.4.gz").exists(), "新归档使用顺次编号 4");
-        // 历史归档保持原编号。
-        assert!(dir.join("query.log.1.gz").exists());
-        assert!(dir.join("query.log.3.gz").exists());
-
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_empty_file_never_rotates() {
-        let dir = tmp_dir("empty");
-        let mut sink = RotatingFileSink::open(LogDirectory {
-            dir: dir.to_string_lossy().into_owned(),
-            maxsize: 1,
-            numfile: 3,
-        })
-        .await
-        .unwrap();
-        sink.write(b"abc").await; // 第一行直接写入，即使超过 maxsize 也不轮转
+        assert_eq!(std::fs::read_to_string(dir.join("query.log")).unwrap(), "first\nsecond\n");
+        assert!(!dir.join("query.log.1").exists(), "rsdns 不再自己轮转");
         assert!(!dir.join("query.log.1.gz").exists());
-        assert_eq!(sink.next, 1, "未轮转则编号不前进");
-        sink.file.flush().await.unwrap();
-        assert_eq!(std::fs::read_to_string(dir.join("query.log")).unwrap(), "abc");
+
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// logrotate 语义：rename 掉 `query.log` + create 之后，`reopen` 必须换到
+    /// 新文件；否则日志继续写进已重命名的旧 inode。
+    #[tokio::test]
+    async fn test_reopen_after_logrotate_rename() {
+        let dir = tmp_dir("reopen");
+        let sink = DirectorySink::open(dir.clone()).await.unwrap();
+
+        sink.write(b"old-line\n").await;
+        sink.file.lock().await.flush().await.unwrap();
+
+        // logrotate: 挪走当前文件（`compress`/`delaycompress` 由外部完成）。
+        std::fs::rename(dir.join("query.log"), dir.join("query.log.1")).unwrap();
+        assert!(!dir.join("query.log").exists());
+
+        // postrotate: systemctl reload → SIGHUP → reopen。
+        sink.reopen().await.unwrap();
+
+        sink.write(b"new-line\n").await;
+        sink.file.lock().await.flush().await.unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join("query.log")).unwrap(),
+            "new-line\n",
+            "重开后的新文件只含轮转之后的日志"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("query.log.1")).unwrap(),
+            "old-line\n",
+            "旧文件内容不被改动"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 重开失败（目录不可用）时保留旧句柄、返回 Err，服务继续写旧文件。
+    #[tokio::test]
+    async fn test_reopen_failure_keeps_old_handle() {
+        let dir = tmp_dir("reopen-fail");
+        let sink = DirectorySink::open(dir.clone()).await.unwrap();
+        sink.write(b"before\n").await;
+        sink.file.lock().await.flush().await.unwrap();
+
+        // 把目录整体挪走，再用一个普通文件占住原路径：`create_dir_all` 必然
+        // 失败（NotADirectory），而旧句柄仍指向挪走后的文件。
+        std::fs::rename(&dir, dir.with_extension("moved")).unwrap();
+        std::fs::write(&dir, b"not a dir").unwrap();
+
+        assert!(sink.reopen().await.is_err(), "不可用目录必须返回 Err");
+
+        sink.write(b"after\n").await;
+        sink.file.lock().await.flush().await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.with_extension("moved").join("query.log")).unwrap(),
+            "before\nafter\n",
+            "重开失败后继续用旧句柄写入"
+        );
+
+        std::fs::remove_file(&dir).unwrap();
+        std::fs::remove_dir_all(dir.with_extension("moved")).unwrap();
+    }
+
+    /// 旧格式 `{dir}:{maxsize}:{numfile}` 直接报错（内置轮转已移除）。
+    #[tokio::test]
+    async fn test_rotating_spec_is_rejected() {
+        let cfg = LogConfig {
+            format: "{name}".into(),
+            directory: Some("/var/log/rsdns:5m:5".into()),
+        };
+        let err = QueryLogger::new(&cfg).await.err().expect("must reject rotating spec");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("logrotate"), "err: {err}");
     }
 }

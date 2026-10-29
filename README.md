@@ -24,7 +24,7 @@
 - **缓存**：LRU，可配置容量、TTL 范围；moka 按条目 TTL 自动过期（无 stale 服务）
 - **连接池**：自适应地址轮换、故障冷却、地址族偏好
 - **文件源**：`groups` / `hosts` 支持 `file://` 源，`notify` 监听文件变化自动重载
-- **systemd notify**：监听器全部绑定后发送 `READY=1`（`Type=notify`）
+- **systemd notify**：监听器全部绑定后发送 `READY=1`（`Type=notify`）；`systemctl reload`（SIGHUP）重开查询日志，配合外部 logrotate 轮转压缩（不重载配置）
 - **ui**：可选内置 Web 状态页 + Prometheus `/metrics`（`ui:` 配置段；`/` 为手机友好的 HTML 仪表盘，`/metrics` 为 Prometheus 文本）
 
 ## 构建
@@ -45,7 +45,8 @@ cargo run --bin rsdns -- -c rsdns.yaml
 ./target/debug/rsdns --config rsdns.yaml
 ```
 
-完整示例配置：`example/rsdns-all-example.yaml`；systemd 部署示例：`example/rsdns.service`。
+完整示例配置：`example/rsdns-all-example.yaml`；systemd 部署示例：`example/rsdns.service`；
+logrotate 示例：`example/rsdns.logrotate`。
 
 ## 最小配置示例
 

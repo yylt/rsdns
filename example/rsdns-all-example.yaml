@@ -202,18 +202,15 @@ rules:
 # Query log (optional): per-query access log with template placeholders.
 # Placeholders: {type} {name} {proto} {remote} {action} {port} {size} {duration} {rcode} {answers}
 #              {time} — query start time (wall-clock, local tz, DD/MM/YYYY:HH:MM:SS ±HHMM)
-# Output: stdout by default; set directory to write rotating files instead.
-#   directory: "{dir}:{maxsize}:{numfile}" — write to dir/query.log; when the
-#   active file reaches maxsize it is gzip-archived as query.log.N.gz with N
-#   increasing monotonically (existing archives are never renamed) and a
-#   fresh file starts; at most numfile files (active + archives) are kept,
-#   the oldest (lowest-N) archives are pruned.
-#   maxsize supports k/K/m/M/g/G suffixes (5m = 5 MB).  A bare directory path
-#   (e.g. "/var/log/rsdns") uses the default maxsize/numfile (5m / 5 files).
+# Output: stdout by default; set directory to write to dir/query.log instead.
+#   directory: a plain directory path (created if missing).  rsdns never
+#   rotates or compresses this file itself — use an external logrotate
+#   (see example/rsdns.logrotate).  After renaming the file, logrotate must
+#   trigger `systemctl reload rsdns` (SIGHUP), which makes rsdns reopen
+#   dir/query.log.  SIGHUP only reopens the log; it does not reload config.
 log:
   format: '{remote}:{port} {name} [{type}] {rcode} {action} {duration}'
-  # directory: '/var/log/rsdns'           # bare path → 5m / 5 files
-  # directory: '/var/log/rsdns:2m:3'      # explicit rotation settings
+  # directory: '/var/log/rsdns'
 
 # Balance plugin (optional): reorders A/AAAA answers before they are
 # returned, and optionally caps the total answer count.  Absent → no

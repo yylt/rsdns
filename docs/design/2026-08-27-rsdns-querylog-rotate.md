@@ -1,6 +1,12 @@
 # rsdns 查询日志：写入目录 + 大小轮转 + gzip 压缩
 
 > 2026-08-27 | 提案
+>
+> 2026-10-29 更新：**内置轮转已被移除**，本文仅作历史记录。现行为
+> `log.directory` 只接受纯目录路径，查询日志只追加写 `dir/query.log`；
+> 轮转 / gzip 压缩 / 保留份数交给外部 `logrotate`，并通过 `systemctl reload`
+> （SIGHUP）让进程重开文件。详见
+> `docs/design/2026-10-29-rsdns-reload.md`。
 
 ## 1. 动机
 
