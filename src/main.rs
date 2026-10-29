@@ -10,7 +10,7 @@ mod server;
 mod upstream;
 
 use clap::Parser;
-use log::{error, warn};
+use log::{error, info, warn};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -249,9 +249,27 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "jemalloc")]
     plugins::jemalloc::spawn_refresh(metrics.clone(), std::time::Duration::from_secs(10));
 
-    // 6. 等待任意 listener 结束（通常不会）。
-    if let Some(Err(e)) = tasks.join_next().await {
-        error!("listener task panicked: {}", e);
+    // 6. SIGHUP（`systemctl reload`）只重开查询日志文件，供外部 logrotate
+    //    的 rename + create 轮转；不重载配置。与 listener 退出一起等待。
+    let mut sighup = {
+        use tokio::signal::unix::{signal, SignalKind};
+        signal(SignalKind::hangup())?
+    };
+
+    loop {
+        tokio::select! {
+            _ = sighup.recv() => match server.reopen_logs().await {
+                Ok(()) => info!("SIGHUP: query log reopened"),
+                Err(e) => error!("SIGHUP: failed to reopen query log: {}", e),
+            },
+            joined = tasks.join_next() => {
+                // 任何 listener 结束（通常不会）→ 退出事件循环。
+                if let Some(Err(e)) = joined {
+                    error!("listener task panicked: {}", e);
+                }
+                break;
+            }
+        }
     }
 
     // 7. 关闭前 flush 日志。

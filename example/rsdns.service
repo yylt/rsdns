@@ -5,6 +5,12 @@
 # marks the service active.  Without systemd (no $NOTIFY_SOCKET) rsdns runs
 # as usual and the notification is skipped.
 #
+# ExecReload: `systemctl reload rsdns` sends SIGHUP, which makes rsdns
+# reopen its query log file (dir/query.log).  That is what an external
+# logrotate needs after renaming the file — see example/rsdns.logrotate.
+# SIGHUP does NOT reload the configuration: rule / upstream / cache changes
+# still require a restart.
+#
 # Install:
 #   sudo cp example/rsdns.service /etc/systemd/system/rsdns.service
 #   sudo systemctl daemon-reload
@@ -18,6 +24,7 @@ Wants=network-online.target
 [Service]
 Type=notify
 ExecStart=/usr/local/bin/rsdns --config /etc/rsdns/rsdns.yaml
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 
 [Install]

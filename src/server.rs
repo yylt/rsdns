@@ -466,6 +466,13 @@ impl DnsServer {
         self.pipeline.logs.flush().await;
     }
 
+    /// Reopens the query log file (`SIGHUP` / `systemctl reload`), so an
+    /// external `logrotate` can rename + create `query.log` without the
+    /// process writing into the rotated inode.  Stdout mode is a no-op.
+    pub async fn reopen_logs(&self) -> io::Result<()> {
+        self.pipeline.logs.reopen().await
+    }
+
     /// Runs the fixed pipeline: logs → hosts → groups → cache → rules,
     /// then writes the upstream response back to cache and serializes the
     /// response.  Cache hits are always fresh (moka evicts expired entries

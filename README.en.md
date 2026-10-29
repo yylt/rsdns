@@ -20,7 +20,7 @@ A rule-driven standalone DNS server implemented in Rust, with composable listene
 - **Cache**: LRU with configurable capacity and TTL clamping; per-entry TTL expiry via moka (no stale serving)
 - **Connection pool**: adaptive address rotation, cooldown on failure, address-family preference
 - **File sources**: `groups` / `hosts` support `file://` sources, auto-reloaded on change via `notify`
-- **systemd notify**: sends `READY=1` once all listeners are bound (`Type=notify`)
+- **systemd notify**: sends `READY=1` once all listeners are bound (`Type=notify`); `systemctl reload` (SIGHUP) reopens the query log so an external logrotate can rotate/compress it (configuration is not reloaded)
 - **ui**: optional built-in web status page + Prometheus `/metrics` (`ui:` config section; `/` is a mobile-friendly HTML dashboard, `/metrics` is the Prometheus text endpoint)
 
 ## Build
@@ -41,7 +41,8 @@ cargo run --bin rsdns -- -c rsdns.yaml
 ./target/debug/rsdns --config rsdns.yaml
 ```
 
-Full example config: `example/rsdns-all-example.yaml`; systemd deployment example: `example/rsdns.service`.
+Full example config: `example/rsdns-all-example.yaml`; systemd deployment example: `example/rsdns.service`;
+logrotate example: `example/rsdns.logrotate`.
 
 ## Minimal config example
 
