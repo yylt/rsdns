@@ -115,8 +115,11 @@ pub struct CacheConfig {
 /// Reorders A/AAAA answers before they are returned: records whose IP falls
 /// in a `prefers` CIDR are moved to the front (list order = priority), then
 /// an optional `mode` post-pass runs, and `max_answers` caps the total
-/// answer count.  Disabled entirely when the `balance:` section is absent;
-/// see the design doc `docs/design/2026-09-04-rsdns-balance.md`.
+/// answer count.  An optional `cloudflare` sub-section replaces answers
+/// inside the built-in Cloudflare ranges with template records (ECH / A /
+/// AAAA).  Disabled entirely when the `balance:` section is absent; see
+/// `docs/design/2026-09-04-rsdns-balance.md` and
+/// `docs/design/2026-11-10-rsdns-balance-cloudflare.md`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct BalanceConfig {
     /// Post-pass mode: `none` (default; only `prefers` + `max_answers` run),
@@ -135,6 +138,28 @@ pub struct BalanceConfig {
     /// Parameters for `mode: speed` (read only in that mode).
     #[serde(default)]
     pub speed: Option<BalanceSpeedConfig>,
+    /// Cloudflare template substitution (ECH / A / AAAA); disabled when the
+    /// sub-section is absent.
+    #[serde(default)]
+    pub cloudflare: Option<BalanceCloudflareConfig>,
+}
+
+/// Cloudflare template substitution (`balance.cloudflare`).
+///
+/// Each template domain is independent: `ech` enables HTTPS `ech` completion,
+/// `a` enables A-answer substitution, `aaaa` enables AAAA-answer substitution.
+/// Each field is `domain@upstream`, naming its own upstream group.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BalanceCloudflareConfig {
+    /// Literal domain whose HTTPS records provide the `ech` template.
+    #[serde(default)]
+    pub ech: Option<String>,
+    /// Literal domain whose A records replace Cloudflare IPv4 answers.
+    #[serde(default)]
+    pub a: Option<String>,
+    /// Literal domain whose AAAA records replace Cloudflare IPv6 answers.
+    #[serde(default)]
+    pub aaaa: Option<String>,
 }
 
 /// Parsed `balance.mode`; only `round_robin` / `speed` carry behaviour
@@ -300,14 +325,6 @@ pub enum RuleActionConfig {
         /// carries the ECS option.  Omitted → no EDNS option is added.
         #[serde(default)]
         edns: Option<String>,
-        /// Cloudflare ECH bootstrap domain (literal, e.g.
-        /// `crypto.cloudflare.com`).  When a HTTPS answer of this rule
-        /// carries an `ipv4hint` inside the built-in Cloudflare IPv4 ranges
-        /// but no `ech` SvcParam, the record is replaced by an HTTPS
-        /// template fetched from this domain (same upstream, cached by TTL).
-        /// Omitted → the feature is disabled for this rule.
-        #[serde(default)]
-        cloudflare_ech: Option<String>,
     },
     /// Rewrite the query with a synthesized IPv4 A answer (no upstream
     /// query).  `target` is a dotted-quad IPv4 (`10.10.0.0`) or a
@@ -486,29 +503,34 @@ rules:
     }
 
     #[test]
-    fn test_forward_cloudflare_ech_parse() {
+    fn test_balance_cloudflare_parse() {
         let yaml = r#"
-rules:
-  - match: ""
-    action: { type: forward, upstream: default, cloudflare_ech: "crypto.cloudflare.com" }
-  - match: ""
-    action: { type: forward, upstream: default }
+balance:
+  cloudflare:
+    ech: "crypto.cloudflare.com@proxy"
+    a: "crypto.cloudflare.com@default"
+    aaaa: "crypto.cloudflare.com@default"
+upstreams: []
 "#;
         let config = Config::from_yaml_str(yaml).expect("parse failed");
-        let raw = config.plugin_sections.get("rules").cloned().unwrap();
-        let configs: Vec<RuleConfig> = serde_yaml::from_value(raw).unwrap();
-        match &configs[0].action {
-            RuleActionConfig::Forward { cloudflare_ech, .. } => {
-                assert_eq!(cloudflare_ech.as_deref(), Some("crypto.cloudflare.com"))
-            }
-            other => panic!("expected Forward, got {other:?}"),
-        }
-        match &configs[1].action {
-            RuleActionConfig::Forward { cloudflare_ech, .. } => {
-                assert!(cloudflare_ech.is_none(), "default must be None")
-            }
-            other => panic!("expected Forward, got {other:?}"),
-        }
+        let raw = config.plugin_sections.get("balance").cloned().unwrap();
+        let cfg: BalanceConfig = serde_yaml::from_value(raw).unwrap();
+        let cf = cfg.cloudflare.expect("cloudflare section");
+        assert_eq!(cf.ech.as_deref(), Some("crypto.cloudflare.com@proxy"));
+        assert_eq!(cf.a.as_deref(), Some("crypto.cloudflare.com@default"));
+        assert_eq!(cf.aaaa.as_deref(), Some("crypto.cloudflare.com@default"));
+
+        // Absent → None; a lone `a` does not imply `aaaa`.
+        let config = Config::from_yaml_str("balance:\n  cloudflare:\n    a: a.example\nupstreams: []\n").unwrap();
+        let raw = config.plugin_sections.get("balance").cloned().unwrap();
+        let cfg: BalanceConfig = serde_yaml::from_value(raw).unwrap();
+        let cf = cfg.cloudflare.expect("cloudflare section");
+        assert_eq!(cf.a.as_deref(), Some("a.example"));
+        assert!(cf.aaaa.is_none());
+        let config = Config::from_yaml_str("balance:\n  mode: none\nupstreams: []\n").unwrap();
+        let raw = config.plugin_sections.get("balance").cloned().unwrap();
+        let cfg: BalanceConfig = serde_yaml::from_value(raw).unwrap();
+        assert!(cfg.cloudflare.is_none());
     }
 
     #[test]

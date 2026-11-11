@@ -49,6 +49,23 @@ pub(crate) fn parse_name(name: &str) -> io::Result<Name> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
+/// 校验并规范化一个域名（拒绝尾随点）；标签 `[a-z0-9-_]`，不允许前导/尾随
+/// `.`、连续点、空标签。
+pub(crate) fn validate_domain(s: &str) -> Option<String> {
+    if s.is_empty() || s.starts_with('.') || s.ends_with('.') {
+        return None;
+    }
+    for label in s.split('.') {
+        if label.is_empty() || label.starts_with('-') {
+            return None;
+        }
+        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            return None;
+        }
+    }
+    Some(s.to_string())
+}
+
 /// Basic response skeleton mirroring the query's id and question.
 ///
 /// Flags: copies the request's opcode and the RD/CD bits into the response
