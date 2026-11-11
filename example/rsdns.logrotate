@@ -19,14 +19,21 @@
 
 /var/log/rsdns/query.log {
     daily
-    rotate 14
-    maxsize 50M
+    rotate 1
+    size 10M
     compress
     delaycompress
     missingok
     notifempty
     create 0640 root root
-    postrotate
-        systemctl reload rsdns >/dev/null 2>&1 || true
-    endscript
+    copytruncate
+}
+
+/var/log/v2.access.log {
+    daily
+    rotate 0
+    size 10M
+    missingok
+    notifempty
+    copytruncate
 }

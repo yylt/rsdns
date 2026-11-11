@@ -15,8 +15,9 @@ A rule-driven standalone DNS server implemented in Rust, with composable listene
   - DoH (`https://`)
   - DoH3 (`h3://`)
   - DoQ (`quic://`)
-- **Query pipeline**: `hosts → groups → cache → rules`; unmatched queries fall back to NXDOMAIN/SERVFAIL
-- **Rules**: `block` (NXDomain or poison IP), `cname` (rewrite + recursive resolve), `forward` (named upstream pool, optional TTL override / resolve_cname / cloudflare_ech completion), `rewrite` (synthesized A record)
+- **Query pipeline**: `hosts → groups → cache → rules → balance`; unmatched queries fall back to NXDOMAIN/SERVFAIL
+- **Rules**: `block` (NXDomain or poison IP), `cname` (rewrite + recursive resolve), `forward` (named upstream pool, optional TTL override / resolve_cname), `rewrite` (synthesized A record)
+- **balance (post-pass)**: `prefers` CIDR priority, `mode` (`round_robin` / `speed`), `max_answers` cap; `balance.cloudflare` substitutes HTTPS/A/AAAA answers inside the built-in Cloudflare ranges with template records (`ech` / `a` / `aaaa`, each using `domain@upstream`)
 - **Cache**: LRU with configurable capacity and TTL clamping; per-entry TTL expiry via moka (no stale serving)
 - **Connection pool**: adaptive address rotation, cooldown on failure, address-family preference
 - **File sources**: `groups` / `hosts` support `file://` sources, auto-reloaded on change via `notify`

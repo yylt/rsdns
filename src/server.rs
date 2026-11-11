@@ -716,8 +716,9 @@ mod tests {
         let hosts = hosts::init(&config, &metrics);
         let groups = groups::init(&config, &metrics);
         let cache = cache::init(&config, &metrics);
-        let balance = balance::init(&config);
+        let mut balance = balance::init(&config);
         let upstreams = upstream::init(&config, &metrics, &hosts, &balance).await.unwrap();
+        balance.attach_upstreams(upstreams.clone());
         let rules = rules::init(&config, &metrics, upstreams).unwrap();
         Arc::new(DnsServer::new(
             Pipeline {
