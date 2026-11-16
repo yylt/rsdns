@@ -17,15 +17,51 @@ use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use hickory_net::runtime::TokioRuntimeProvider;
-use hickory_net::xfer::{DnsExchange, DnsRequestSender};
+use hickory_net::xfer::{DnsExchange, DnsHandle, DnsRequestSender};
+use hickory_proto::op::DnsRequest;
 
-/// A `DnsExchange` over the Tokio runtime — cloneable `DnsHandle` backed by a
-/// spawned `DnsExchangeBackground` task.
-pub type Exchange = DnsExchange<TokioRuntimeProvider>;
+/// A cloneable DNS handle with explicit background-driver liveness.
+#[derive(Clone)]
+pub struct Exchange {
+    inner: DnsExchange<TokioRuntimeProvider>,
+    closed: Arc<AtomicBool>,
+}
+
+impl Exchange {
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+}
+
+impl DnsHandle for Exchange {
+    type Response = <DnsExchange<TokioRuntimeProvider> as DnsHandle>::Response;
+    type Runtime = TokioRuntimeProvider;
+
+    fn send(&self, request: DnsRequest) -> Self::Response {
+        self.inner.send(request)
+    }
+
+    fn is_verifying_dnssec(&self) -> bool {
+        self.inner.is_verifying_dnssec()
+    }
+
+    fn is_using_edns(&self) -> bool {
+        self.inner.is_using_edns()
+    }
+}
+
+struct DriverLifetime(Arc<AtomicBool>);
+
+impl Drop for DriverLifetime {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
 
 /// Type-erased async factory: given a `SocketAddr`, produces an [`Exchange`].
 ///
@@ -38,9 +74,16 @@ pub type ConnFactory =
 /// Wraps a `DnsRequestSender` in a [`DnsExchange`] and spawns its background
 /// driver task.
 pub fn exchange_from<S: DnsRequestSender>(stream: S) -> Exchange {
-    let (exchange, bg) = DnsExchange::from_stream(stream);
-    tokio::spawn(bg);
-    exchange
+    let (inner, bg) = DnsExchange::from_stream(stream);
+    let closed = Arc::new(AtomicBool::new(false));
+    let lifetime = DriverLifetime(closed.clone());
+    tokio::spawn(async move {
+        // Mark closed on normal exit, panic, or task cancellation, including
+        // cancellation before the driver is polled for the first time.
+        let _lifetime = lifetime;
+        bg.await
+    });
+    Exchange { inner, closed }
 }
 
 /// Builds an [`Exchange`] by invoking a `ConnFactory` with a connect timeout.
@@ -55,5 +98,4 @@ pub async fn build_exchange(
     tokio::time::timeout(connect_timeout, factory(addr))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timeout"))?
-        .map_err(|e| io::Error::other(e.to_string()))
 }

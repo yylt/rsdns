@@ -232,15 +232,15 @@ pub enum BlockResponse {
 #[derive(Debug, Clone)]
 pub struct Rule {
     pub target: MatchTarget,
-    pub qtype: Option<RecordType>,
+    pub qtype: Option<Vec<RecordType>>,
     pub action: RuleAction,
 }
 
 impl Rule {
     fn qtype_matches(&self, qtype: RecordType) -> bool {
-        match self.qtype {
+        match &self.qtype {
             None => true,
-            Some(expected) => expected == RecordType::ANY || expected == qtype,
+            Some(expected) => expected.contains(&RecordType::ANY) || expected.contains(&qtype),
         }
     }
 
@@ -442,7 +442,17 @@ pub fn init(
             Some(s) => parse_match_target(s).map_err(|e| format!("rules[{idx}]: {e}"))?,
             None => MatchTarget::MatchAll,
         };
-        let qtype = rc.qtype.as_ref().map(|qt| parse_qtype(qt));
+        let qtype = rc
+            .qtype
+            .as_deref()
+            .map(|qtypes| {
+                qtypes
+                    .split(',')
+                    .map(|qt| parse_qtype(qt.trim()))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()
+            .map_err(|e| format!("rules[{idx}].qtype: {e}"))?;
         let action = match &rc.action {
             RuleActionConfig::Block { response } => RuleAction::Block {
                 response: match response {
@@ -459,7 +469,11 @@ pub fn init(
                 target: target.clone(),
                 ttl: ttl.unwrap_or(600),
                 upstream: upstream.clone(),
-                deny_qtypes: deny_qtypes.iter().map(|qt| parse_qtype(qt)).collect(),
+                deny_qtypes: deny_qtypes
+                    .iter()
+                    .map(|qt| parse_qtype(qt))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("rules[{idx}].action.deny_qtypes: {e}"))?,
             },
             RuleActionConfig::Forward {
                 upstream,
@@ -470,7 +484,11 @@ pub fn init(
             } => RuleAction::Forward {
                 upstream: upstream.clone(),
                 ttl: *ttl,
-                deny_qtypes: deny_qtypes.iter().map(|qt| parse_qtype(qt)).collect(),
+                deny_qtypes: deny_qtypes
+                    .iter()
+                    .map(|qt| parse_qtype(qt))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("rules[{idx}].action.deny_qtypes: {e}"))?,
                 resolve_cname: *resolve_cname,
                 subnet: parse_rule_edns(edns.as_deref()),
             },
@@ -491,12 +509,12 @@ pub fn init(
     })
 }
 
-fn parse_qtype(s: &str) -> hickory_proto::rr::RecordType {
-    let upper = s.to_ascii_uppercase();
-    upper
-        .parse::<hickory_proto::rr::RecordType>()
-        .or_else(|_| s.parse::<u16>().map(RecordType::from))
-        .unwrap_or_else(|_| panic!("invalid query type: {s}"))
+fn parse_qtype(s: &str) -> Result<RecordType, String> {
+    if s == "*" {
+        return Err(format!("invalid query type {s:?}: expected a standard uppercase type name"));
+    }
+    s.parse::<RecordType>()
+        .map_err(|_| format!("invalid query type {s:?}: expected a standard uppercase type name"))
 }
 
 /// Parses the forward rule's `edns` CIDR into a [`ClientSubnet`]; an
@@ -927,6 +945,118 @@ mod tests {
 
     fn parse_ok(s: &str) -> MatchTarget {
         parse_match_target(s).unwrap()
+    }
+
+    fn init_rules(yaml: &str) -> Result<Rules, String> {
+        let config = Config::from_yaml_str(yaml).expect("config parses");
+        // Each initialization needs a fresh thread-local metric name registry.
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let metrics = MetricsRegistry::new();
+                    let hosts = crate::plugins::hosts::init(&config, &metrics);
+                    let balance = crate::plugins::balance::init(&config);
+                    let upstreams = crate::upstream::init(&config, &metrics, &hosts, &balance)
+                        .await
+                        .expect("upstreams init");
+                    init(&config, &metrics, upstreams)
+                })
+        })
+        .join()
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_qtype_lists_match_all_rule_paths() {
+        use crate::plugins::cache::CacheKey;
+        use std::net::SocketAddr;
+        use std::time::Instant;
+
+        for target in ["*", "example.com", "{1}.example.com", "group:test"] {
+            for (qtype_config, expected) in [
+                ("    qtype: ' A, AAAA , HTTPS ' \n", vec![true, true, true, false]),
+                ("    qtype: 'A'\n", vec![true, false, false, false]),
+                ("    qtype: ' ANY '\n", vec![true; 4]),
+                ("    qtype: 'A, ANY'\n", vec![true; 4]),
+                ("", vec![true; 4]),
+            ] {
+                let yaml = format!(
+                    "upstreams: []\nrules:\n  - match: '{target}'\n{qtype_config}    action:\n      type: block\n"
+                );
+                let rules = init_rules(&yaml).expect("valid qtypes initialize");
+                if target == "example.com" {
+                    assert_eq!(rules.inline_hit("node.example.com"), Some(0));
+                }
+                for (qtype, matches) in [RecordType::A, RecordType::AAAA, RecordType::HTTPS, RecordType::MX]
+                    .into_iter()
+                    .zip(expected)
+                {
+                    let mut ctx = QueryContext::new(
+                        make_query_msg("node.example.com", qtype).unwrap(),
+                        CacheKey::new("node.example.com", qtype),
+                        SocketAddr::from(([127, 0, 0, 1], 5353)),
+                        "udp",
+                        Instant::now(),
+                        0,
+                    );
+                    ctx.group = Some("test".into());
+                    assert_eq!(
+                        rules.rules[0].matches(&mut ctx),
+                        matches,
+                        "target={target}, config={qtype_config:?}, query={qtype}"
+                    );
+                    rules.handle(&mut ctx).await;
+                    assert_eq!(ctx.action, if matches { "block-nxdomain" } else { "nxdomain" });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_init_rejects_invalid_qtypes() {
+        for bad in [
+            "",
+            " ",
+            ",",
+            "A,",
+            ",A",
+            "A,,AAAA",
+            "A, ,HTTPS",
+            "a",
+            "aaaa",
+            "Aaaa",
+            "Https",
+            "1",
+            "65",
+            "TYPE65",
+            "BOGUS",
+            "*",
+            "A,65",
+            "A,aaaa",
+            "ANY,BOGUS",
+            "ANY,",
+        ] {
+            let yaml = format!("upstreams: []\nrules:\n  - qtype: '{bad}'\n    action:\n      type: block\n");
+            let err = init_rules(&yaml).err().expect("invalid qtype must return an error");
+            assert!(err.contains("rules[0].qtype"), "missing rule/field context: {err}");
+            assert!(err.contains("invalid query type"), "unexpected error for {bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_init_rejects_invalid_deny_qtypes_without_panicking() {
+        for action in ["forward", "cname"] {
+            let yaml = format!(
+                "upstreams: []\nrules:\n  - action:\n      type: {action}\n      upstream: default\n      target: example.com\n      deny_qtypes: [BOGUS]\n"
+            );
+            let err = init_rules(&yaml)
+                .err()
+                .expect("invalid deny_qtypes must return an error");
+            assert!(err.contains("rules[0].action.deny_qtypes"), "missing field context: {err}");
+        }
     }
 
     #[test]

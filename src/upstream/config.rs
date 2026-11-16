@@ -9,65 +9,6 @@ use std::time::Duration;
 
 use super::pool::{PoolConfig, PreferFamily};
 
-/// Parsed cooldown policy: `window:errors:cooldown`, e.g. `1m:10:10s`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CooldownConfig {
-    /// Sliding error-count window length.
-    pub window: Duration,
-    /// Error count within `window` that triggers cooling.
-    pub threshold: u32,
-    /// How long a server is skipped once tripped.
-    pub cooldown: Duration,
-}
-
-/// Parses a `<window>:<errors>:<cooldown>` spec into [`CooldownConfig`].
-///
-/// Durations accept a unit suffix (`s`/`m`/`h`); a bare number means
-/// seconds.  `errors` must be ≥ 1.  Returns `None` for an empty input,
-/// `Some(...)` on success.
-pub fn parse_cooldown(s: &str) -> Result<Option<CooldownConfig>, String> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Ok(None);
-    }
-    let parts: Vec<&str> = s.split(':').map(str::trim).collect();
-    if parts.len() != 3 {
-        return Err(format!("invalid cooldown {s:?}: expected <window>:<errors>:<cooldown>"));
-    }
-    let window = parse_duration(parts[0]).ok_or_else(|| format!("invalid cooldown {s:?}: bad window duration"))?;
-    let threshold: u32 = parts[1]
-        .parse()
-        .map_err(|_| format!("invalid cooldown {s:?}: errors must be a number"))?;
-    if threshold == 0 {
-        return Err(format!("invalid cooldown {s:?}: errors must be >= 1"));
-    }
-    let cooldown = parse_duration(parts[2]).ok_or_else(|| format!("invalid cooldown {s:?}: bad cooldown duration"))?;
-    Ok(Some(CooldownConfig {
-        window,
-        threshold,
-        cooldown,
-    }))
-}
-
-/// Parses a duration with an optional unit suffix (`s`/`m`/`h`); a bare
-/// number means seconds.  `0` is rejected.
-fn parse_duration(s: &str) -> Option<Duration> {
-    let (num, mult) = if let Some(n) = s.strip_suffix('h') {
-        (n, 3600u64)
-    } else if let Some(n) = s.strip_suffix('m') {
-        (n, 60u64)
-    } else if let Some(n) = s.strip_suffix('s') {
-        (n, 1u64)
-    } else {
-        (s, 1u64)
-    };
-    let n: u64 = num.parse().ok()?;
-    if n == 0 {
-        return None;
-    }
-    Some(Duration::from_secs(n.saturating_mul(mult)))
-}
-
 /// A single upstream server entry.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
@@ -91,14 +32,22 @@ pub struct UpstreamGroupConfig {
     pub name: String,
     #[serde(default)]
     pub mode: QueryModeConfig,
-    /// Circuit-breaker style per-server cooling, written as
-    /// `<window>:<errors>:<cooldown>`, e.g. `1m:10:10s` = if a server
-    /// fails 10 times within a 1-minute window, cool it down for 10
-    /// seconds (skipped during queries).  Omitted → no cooling.
-    #[serde(default)]
-    pub cooldown: Option<String>,
+    /// Total query budget in seconds, including queueing, connections and fallback.
+    #[serde(default = "default_query_timeout")]
+    pub query_timeout: std::num::NonZeroU16,
+    /// Per-server attempt budget in seconds, including queueing, connections and DNS.
+    #[serde(default = "default_attempt_timeout")]
+    pub attempt_timeout: std::num::NonZeroU16,
     #[serde(default)]
     pub servers: Vec<ServerConfig>,
+}
+
+fn default_query_timeout() -> std::num::NonZeroU16 {
+    std::num::NonZeroU16::new(5).expect("positive default query timeout")
+}
+
+fn default_attempt_timeout() -> std::num::NonZeroU16 {
+    std::num::NonZeroU16::new(2).expect("positive default attempt timeout")
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
@@ -123,8 +72,6 @@ pub struct RawPoolConfig {
     pub idle_timeout: Option<u16>,
     /// Connect timeout in seconds.
     pub connect_timeout: Option<u16>,
-    /// Per-request DNS timeout in seconds.
-    pub dns_timeout: Option<u16>,
     /// Address family filter used when bootstrap-resolving a domain upstream:
     /// `"any"` (default), `"ipv4"`, or `"ipv6"`.
     pub prefer_family: Option<String>,
@@ -142,7 +89,7 @@ impl RawPoolConfig {
         PoolConfig {
             idle_timeout: opt_dur(self.idle_timeout, defaults.idle_timeout),
             connect_timeout: opt_dur(self.connect_timeout, defaults.connect_timeout),
-            dns_timeout: opt_dur(self.dns_timeout, defaults.dns_timeout),
+            dns_timeout: defaults.dns_timeout,
         }
     }
 

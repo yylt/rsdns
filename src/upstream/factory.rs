@@ -4,9 +4,8 @@
 //! Pin<Box<dyn Future<…>>>>>` closure that, given a resolved `SocketAddr`, creates a
 //! fresh [`Exchange`] for that protocol.
 //!
-//! All factories use `.build()` rather than `.exchange()`, giving the connection
-//! pool ([`super::pool::ConnectionPool`]) full control over when the background
-//! driver task is spawned via [`exchange_from`].
+//! Factories use `.build()` rather than `.exchange()` and start the Exchange
+//! driver via [`exchange_from`]. H3 may also start its own protocol driver.
 //!
 //! ## Protocol notes
 //!
@@ -36,9 +35,6 @@ use rustls::pki_types::ServerName;
 
 use super::conn::{exchange_from, ConnFactory};
 
-/// Per-request DNS timeout used inside the multiplexer / stream.
-const DNS_TIMEOUT: Duration = Duration::from_secs(5);
-
 // ---------------------------------------------------------------------------
 // Protocol factories
 // ---------------------------------------------------------------------------
@@ -57,13 +53,17 @@ pub fn udp_factory() -> ConnFactory {
 
 // ── TCP ────────────────────────────────────────────────────────────
 
-pub fn tcp_factory() -> ConnFactory {
-    Arc::new(|addr: SocketAddr| {
+pub fn tcp_factory(connect_timeout: Duration, dns_timeout: Duration) -> ConnFactory {
+    Arc::new(move |addr: SocketAddr| {
         let fut = async move {
-            let (stream, handle) =
-                hickory_net::tcp::TcpClientStream::new(addr, None, Some(DNS_TIMEOUT), TokioRuntimeProvider::default());
+            let (stream, handle) = hickory_net::tcp::TcpClientStream::new(
+                addr,
+                None,
+                Some(connect_timeout),
+                TokioRuntimeProvider::default(),
+            );
             let tcp_stream = stream.await.map_err(|e| io::Error::other(e.to_string()))?;
-            let mux = DnsMultiplexer::new(tcp_stream, handle);
+            let mux = DnsMultiplexer::new(tcp_stream, handle).with_timeout(dns_timeout);
             Ok(exchange_from(mux))
         };
         Box::pin(fut)
@@ -72,7 +72,7 @@ pub fn tcp_factory() -> ConnFactory {
 
 // ── TLS (DNS-over-TLS) ─────────────────────────────────────────────
 
-pub fn tls_factory(server_name: String, tls_config: Arc<rustls::ClientConfig>) -> ConnFactory {
+pub fn tls_factory(server_name: String, tls_config: Arc<rustls::ClientConfig>, dns_timeout: Duration) -> ConnFactory {
     Arc::new(move |addr: SocketAddr| {
         let server_name_str = server_name.clone();
         let client_config = tls_config.clone();
@@ -82,7 +82,7 @@ pub fn tls_factory(server_name: String, tls_config: Arc<rustls::ClientConfig>) -
             let (stream, handle) =
                 hickory_net::tls::tls_client_connect(addr, sn, client_config, TokioRuntimeProvider::default());
             let tls_stream = stream.await.map_err(|e| io::Error::other(e.to_string()))?;
-            let mux = DnsMultiplexer::new(tls_stream, handle);
+            let mux = DnsMultiplexer::new(tls_stream, handle).with_timeout(dns_timeout);
             Ok(exchange_from(mux))
         };
         Box::pin(fut)

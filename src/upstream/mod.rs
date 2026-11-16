@@ -6,7 +6,7 @@
 //! - [`config`] — configuration types (`upstreams[]` / `servers` / `pool`)
 //! - [`conn`] — `Exchange` (`DnsExchange`) + connection factory types
 //! - [`factory`] — protocol-specific connection factories
-//! - [`pool`] — adaptive connection pool
+//! - [`pool`] — bounded shared connection pool
 //! - this module — [`UpstreamClient`], [`UpstreamGroup`], [`Upstreams`]
 //!   and [`init`] (parse → hosts-first / bootstrap resolve → balance rank → assemble → [`Upstreams`])
 //!
@@ -27,7 +27,7 @@
 //! | DNS transport      | `dns timeout` — no response within `dns_timeout` | TimedOut |
 //! | Stream closed      | Multiplexer or QUIC stream terminated | ConnectionAborted, ConnectionReset, UnexpectedEof |
 //! | DNS format         | Wire-format parse error in response | Other |
-//! | Mux queue overflow | `mux request queue full` (256 outstanding requests) | Other |
+//! | Mux queue overflow | Dependency queue full (pool limits requests to 32) | Other |
 //!
 //! Errors that do **not** produce `Err` (they arrive as `Ok(Message)`)
 //! because a valid DNS response was received:
@@ -43,20 +43,17 @@
 //! `UpstreamGroup` retry semantics:
 //!
 //! - **Serial mode**: iterates clients in config order; first `Ok` response
-//!   wins; on `Err`, moves to the next client.  Returns the last error if
+//!   wins; on `Err`, moves to the next client.  Returns the first error if
 //!   all clients fail.
 //! - **Parallel mode**: races all clients concurrently; first `Ok` wins;
-//!   on `Err`, waits for remaining.  Returns the last error if all fail.
+//!   on `Err`, waits for remaining.  Returns the first error if all fail.
 //! - **Random mode**: picks a random order per query, then behaves like
 //!   serial (first `Ok` wins, next on error).
 //! - **RoundRobin mode**: rotates the starting client per query, then
 //!   behaves like serial.
 //!
-//! All fallback modes (serial/random/round-robin) skip clients currently in
-//! **cooldown** (see [`config::CooldownConfig`]) — a per-client circuit
-//! breaker that trips after `threshold` transport errors within `window`
-//! and skips the client for `cooldown`.  If every client is in cooldown, a
-//! `NotConnected` error is returned immediately.
+//! Every server attempt is bounded by the group's remaining total budget and
+//! its per-server attempt timeout, including queueing, connection setup and DNS.
 //!
 //! In all modes, retry is at the **server** (UpstreamClient) granularity,
 //! not at the connection level.  Connection-level retry (same server,
@@ -74,21 +71,18 @@ use hickory_net::xfer::{DnsHandle, FirstAnswer};
 use hickory_proto::op::{DnsRequest, DnsRequestOptions, Edns, Message};
 use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsCode, EdnsOption};
 use log::{info, warn};
-use parking_lot::Mutex;
 use rand::seq::SliceRandom;
-use std::collections::VecDeque;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 
 use crate::common::tls::default_tls_client_config;
 
 use crate::config::Config;
 use crate::metrics::{Counter, Histogram, MetricsRegistry};
 
-use self::config::{parse_cooldown, CooldownConfig, QueryModeConfig, RawPoolConfig};
+use self::config::{QueryModeConfig, RawPoolConfig};
 use self::pool::{ConnectionPool, PreferFamily};
 
 /// A single upstream DNS client backed by a connection pool.
@@ -116,17 +110,22 @@ impl UpstreamClient {
     /// `sender.send(request).first_answer().await` with the pool's per-request
     /// DNS timeout.
     pub async fn query(&self, msg: &Message) -> io::Result<Message> {
-        let guard = self
-            .pool
-            .checkout()
+        self.query_until(msg, tokio::time::Instant::now() + self.pool.dns_timeout())
             .await
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no available connection in pool"))?;
+    }
+
+    async fn query_until(&self, msg: &Message, deadline: tokio::time::Instant) -> io::Result<Message> {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(query_timeout());
+        }
+        let guard = self.pool.checkout(deadline).await?;
 
         let request = DnsRequest::new(msg.clone(), DnsRequestOptions::default());
-        let result = tokio::time::timeout(self.pool.dns_timeout(), guard.sender().send(request).first_answer())
+        let request_deadline = deadline.min(tokio::time::Instant::now() + self.pool.dns_timeout());
+        let result = tokio::time::timeout_at(request_deadline, guard.sender().send(request).first_answer())
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "dns timeout"))
-            .and_then(|response| response.map(|m| m.into_message()).map_err(io::Error::other));
+            .map_err(|_| query_timeout())
+            .and_then(|response| response.map(|m| m.into_message()).map_err(transport_error));
 
         match result {
             Ok(message) => {
@@ -134,11 +133,27 @@ impl UpstreamClient {
                 Ok(message)
             }
             Err(err) => {
-                guard.record_failure();
+                guard.record_failure(&err);
                 Err(err)
             }
         }
     }
+}
+
+fn query_timeout() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "upstream query deadline exceeded")
+}
+
+fn transport_error(error: hickory_net::NetError) -> io::Error {
+    use hickory_net::NetError;
+    let kind = match &error {
+        NetError::Timeout => io::ErrorKind::TimedOut,
+        NetError::Io(error) => error.kind(),
+        NetError::NoConnections => io::ErrorKind::BrokenPipe,
+        _ if error.is_connection_closed() => io::ErrorKind::BrokenPipe,
+        _ => io::ErrorKind::Other,
+    };
+    io::Error::new(kind, error)
 }
 
 /// Inserts the EDNS Client Subnet option into `msg` if not already present.
@@ -163,64 +178,26 @@ pub(crate) fn apply_edns(msg: &mut Message, subnet: &ClientSubnet) {
 pub struct UpstreamGroup {
     clients: Vec<UpstreamClient>,
     mode: QueryModeConfig,
-    cooldown: Option<CooldownConfig>,
+    query_timeout: std::time::Duration,
+    attempt_timeout: std::time::Duration,
     /// Round-robin cursor (per group, shared across queries).
     rr_cursor: AtomicUsize,
-    /// Per-client cooldown state, one entry per client.
-    breaker: Vec<Breaker>,
-}
-
-/// Sliding-window circuit breaker for one client.
-struct Breaker {
-    /// Recent transport-error timestamps (for window counting).
-    errors: Mutex<VecDeque<Instant>>,
-    /// Until when this client is skipped.
-    cool_until: Mutex<Option<Instant>>,
-}
-
-impl Breaker {
-    fn new() -> Self {
-        Self {
-            errors: Mutex::new(VecDeque::new()),
-            cool_until: Mutex::new(None),
-        }
-    }
-
-    fn in_cooldown(&self, now: Instant) -> bool {
-        self.cool_until.lock().is_some_and(|until| until > now)
-    }
-
-    fn record_failure(&self, cfg: CooldownConfig, now: Instant) {
-        // Drop errors outside the window, then push the new one.
-        let mut errors = self.errors.lock();
-        while errors.front().is_some_and(|t| now.duration_since(*t) > cfg.window) {
-            errors.pop_front();
-        }
-        errors.push_back(now);
-        if errors.len() as u32 >= cfg.threshold {
-            *self.cool_until.lock() = Some(now + cfg.cooldown);
-        }
-    }
-
-    fn record_success(&self) {
-        self.errors.lock().clear();
-    }
 }
 
 impl UpstreamGroup {
-    /// Creates a group with a cooldown policy.
-    pub fn with_cooldown(
+    /// Creates a group with total-query and per-server attempt budgets.
+    pub fn new(
         clients: Vec<UpstreamClient>,
         mode: QueryModeConfig,
-        cooldown: Option<CooldownConfig>,
+        query_timeout: std::time::Duration,
+        attempt_timeout: std::time::Duration,
     ) -> Self {
-        let n = clients.len();
         Self {
             clients,
             mode,
-            cooldown,
+            query_timeout,
+            attempt_timeout,
             rr_cursor: AtomicUsize::new(0),
-            breaker: (0..n).map(|_| Breaker::new()).collect(),
         }
     }
 
@@ -231,11 +208,12 @@ impl UpstreamGroup {
 
     /// Sends `msg` using the group's configured query mode.
     pub async fn query(&self, msg: &Message) -> io::Result<Message> {
+        let deadline = tokio::time::Instant::now() + self.query_timeout;
         match self.mode {
-            QueryModeConfig::Serial => self.query_ordered(msg, &self.serial_order()).await,
-            QueryModeConfig::Random => self.query_ordered(msg, &self.random_order()).await,
-            QueryModeConfig::RoundRobin => self.query_ordered(msg, &self.round_robin_order()).await,
-            QueryModeConfig::Parallel => self.query_parallel(msg).await,
+            QueryModeConfig::Serial => self.query_ordered(msg, &self.serial_order(), deadline).await,
+            QueryModeConfig::Random => self.query_ordered(msg, &self.random_order(), deadline).await,
+            QueryModeConfig::RoundRobin => self.query_ordered(msg, &self.round_robin_order(), deadline).await,
+            QueryModeConfig::Parallel => self.query_parallel(msg, deadline).await,
         }
     }
 
@@ -261,81 +239,48 @@ impl UpstreamGroup {
         (0..n).map(|i| (start + i) % n).collect()
     }
 
-    /// Ordered fallback: try each client (skipping cooldown) in `order`;
-    /// first `Ok` wins; records failures/successes for the breaker.
-    async fn query_ordered(&self, msg: &Message, order: &[usize]) -> io::Result<Message> {
+    /// Ordered fallback: try each client with a fresh attempt budget; first `Ok` wins.
+    async fn query_ordered(
+        &self,
+        msg: &Message,
+        order: &[usize],
+        deadline: tokio::time::Instant,
+    ) -> io::Result<Message> {
         let mut first_err: Option<io::Error> = None;
-        let mut tried_any = false;
-        let now = Instant::now();
-        let cooldown = self.cooldown;
         for &idx in order {
-            let Some(client) = self.clients.get(idx) else { continue };
-            let breaker = &self.breaker[idx];
-            if cooldown.is_some() && breaker.in_cooldown(now) {
-                continue;
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(query_timeout());
             }
-            tried_any = true;
-            match client.query(msg).await {
-                Ok(response) => {
-                    if cooldown.is_some() {
-                        breaker.record_success();
-                    }
-                    return Ok(response);
-                }
+            let Some(client) = self.clients.get(idx) else { continue };
+            let attempt_deadline = deadline.min(now + self.attempt_timeout);
+            match client.query_until(msg, attempt_deadline).await {
+                Ok(response) => return Ok(response),
                 Err(e) => {
-                    if let Some(cfg) = cooldown {
-                        breaker.record_failure(cfg, Instant::now());
-                    }
                     if first_err.is_none() {
                         first_err = Some(e);
                     }
                 }
             }
         }
-        if !tried_any {
-            return Err(io::Error::new(io::ErrorKind::NotConnected, "all upstreams in cooldown"));
-        }
         Err(first_err.unwrap_or_else(|| io::Error::other(NO_UPSTREAMS_MSG)))
     }
 
-    async fn query_parallel(&self, msg: &Message) -> io::Result<Message> {
-        // Parallel mode also respects cooldown: clients in cooldown are
-        // skipped; if all are skipped, fail fast with NotConnected.
-        let now = Instant::now();
-        let cooldown = self.cooldown;
-        let indices: Vec<usize> = self
+    async fn query_parallel(&self, msg: &Message, deadline: tokio::time::Instant) -> io::Result<Message> {
+        let mut futs: FuturesUnordered<_> = self
             .clients
             .iter()
-            .enumerate()
-            .filter(|(i, _)| !(cooldown.is_some() && self.breaker[*i].in_cooldown(now)))
-            .map(|(i, _)| i)
-            .collect();
-        if indices.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::NotConnected, "all upstreams in cooldown"));
-        }
-
-        let mut futs: FuturesUnordered<_> = indices
-            .iter()
-            .map(|&i| {
-                let client = self.clients[i].clone();
-                let m = msg.clone();
-                async move { (i, client.query(&m).await) }
+            .map(|client| async move {
+                let attempt_deadline = deadline.min(tokio::time::Instant::now() + self.attempt_timeout);
+                client.query_until(msg, attempt_deadline).await
             })
             .collect();
 
         let mut first_err: Option<io::Error> = None;
-        while let Some((idx, result)) = futs.next().await {
+        while let Some(result) = futs.next().await {
             match result {
-                Ok(response) => {
-                    if cooldown.is_some() {
-                        self.breaker[idx].record_success();
-                    }
-                    return Ok(response);
-                }
+                Ok(response) => return Ok(response),
                 Err(e) => {
-                    if let Some(cfg) = cooldown {
-                        self.breaker[idx].record_failure(cfg, Instant::now());
-                    }
                     if first_err.is_none() {
                         first_err = Some(e);
                     }
@@ -369,6 +314,15 @@ enum UpstreamConfig {
     },
 }
 
+fn dot_tls_client_config() -> Arc<rustls::ClientConfig> {
+    let mut config = (*default_tls_client_config()).clone();
+    // Some DoT resolvers reject queries when the TLS ClientHello carries SNI.
+    // Certificate verification still uses the configured server name.
+    config.enable_sni = false;
+    config.alpn_protocols = vec![b"dot".to_vec()];
+    Arc::new(config)
+}
+
 impl UpstreamConfig {
     fn needs_resolve(&self) -> bool {
         matches!(self, Self::NeedResolve { .. })
@@ -376,19 +330,24 @@ impl UpstreamConfig {
 
     fn from_tls_url(rest: &str, tls_name: Option<String>, raw_pool: Option<RawPoolConfig>) -> Option<Self> {
         let (host, port) = parse_host_port(rest)?;
-        let tls_config = default_tls_client_config();
+        let tls_config = dot_tls_client_config();
+        let dns_timeout = raw_pool.clone().unwrap_or_default().into_pool_config().dns_timeout;
         // TLS server name: explicit `server_name` wins, otherwise the address host.
         let tls_name = tls_name.unwrap_or_else(|| host.clone());
         match host.as_str().parse::<IpAddr>() {
             Ok(ip) => {
                 let addr = SocketAddr::new(ip, port);
                 let pool_cfg = raw_pool.unwrap_or_default().into_pool_config();
-                let pool =
-                    ConnectionPool::with_proto(vec![addr], factory::tls_factory(tls_name, tls_config), pool_cfg, "tls");
+                let pool = ConnectionPool::with_proto(
+                    vec![addr],
+                    factory::tls_factory(tls_name, tls_config, dns_timeout),
+                    pool_cfg,
+                    "tls",
+                );
                 Some(Self::Pool { pool })
             }
             Err(_) => {
-                let factory = factory::tls_factory(tls_name, tls_config);
+                let factory = factory::tls_factory(tls_name, tls_config, dns_timeout);
                 let prefer_family = raw_pool.as_ref().map_or(PreferFamily::Any, |p| p.prefer_family());
                 Some(Self::NeedResolve {
                     server_name: host,
@@ -476,7 +435,12 @@ impl UpstreamConfig {
 
 fn build_tcp_pool(addr: SocketAddr, raw_pool: Option<RawPoolConfig>) -> Arc<ConnectionPool> {
     let pool_cfg = raw_pool.unwrap_or_default().into_pool_config();
-    ConnectionPool::with_proto(vec![addr], factory::tcp_factory(), pool_cfg, "tcp")
+    ConnectionPool::with_proto(
+        vec![addr],
+        factory::tcp_factory(pool_cfg.connect_timeout, pool_cfg.dns_timeout),
+        pool_cfg,
+        "tcp",
+    )
 }
 
 fn build_udp_pool(addr: SocketAddr, raw_pool: Option<RawPoolConfig>) -> Arc<ConnectionPool> {
@@ -520,11 +484,12 @@ fn parse_host_port_default_53(s: &str) -> Option<(String, u16)> {
 /// Builds a `NeedResolve` config for a UDP/TCP server whose address host is
 /// a domain (to be resolved via the bootstrap clients at startup).
 fn tcp_need_resolve(host: String, port: u16, raw_pool: Option<RawPoolConfig>) -> UpstreamConfig {
+    let pool_cfg = raw_pool.clone().unwrap_or_default().into_pool_config();
     let prefer_family = raw_pool.as_ref().map_or(PreferFamily::Any, |p| p.prefer_family());
     UpstreamConfig::NeedResolve {
         server_name: host,
         port,
-        factory: factory::tcp_factory(),
+        factory: factory::tcp_factory(pool_cfg.connect_timeout, pool_cfg.dns_timeout),
         raw_pool,
         proto: "tcp",
         prefer_family,
@@ -784,22 +749,12 @@ pub async fn init(
     balance: &crate::plugins::balance::Balance,
 ) -> Result<Arc<Upstreams>, String> {
     let mut all_configs: Vec<UpstreamConfig> = Vec::new();
-    let mut upstream_map: Vec<(String, Vec<usize>, QueryModeConfig, Option<CooldownConfig>)> = Vec::new();
+    let mut upstream_map = Vec::new();
 
     info!("rsdns starting, upstream pools: {}", config.upstreams.len());
     for group in &config.upstreams {
         let servers = &group.servers;
         info!("  upstream pool '{}': {} server(s)", group.name, servers.len());
-        let cooldown = match &group.cooldown {
-            Some(spec) => match parse_cooldown(spec) {
-                Ok(cd) => cd,
-                Err(e) => {
-                    warn!("  upstream pool '{}': {}", group.name, e);
-                    None
-                }
-            },
-            None => None,
-        };
         let mut indices = Vec::new();
         for server in servers {
             let idx = all_configs.len();
@@ -813,7 +768,13 @@ pub async fn init(
                 warn!("    failed to parse upstream: {}", server.address);
             }
         }
-        upstream_map.push((group.name.clone(), indices, group.mode, cooldown));
+        upstream_map.push((
+            group.name.clone(),
+            indices,
+            group.mode,
+            std::time::Duration::from_secs(u64::from(group.query_timeout.get())),
+            std::time::Duration::from_secs(u64::from(group.attempt_timeout.get())),
+        ));
     }
 
     // Phase 1: bootstrap resolvers — every server whose address is an IP.
@@ -906,7 +867,7 @@ pub async fn init(
 
     let groups: AHashMap<String, UpstreamGroup> = upstream_map
         .into_iter()
-        .map(|(name, indices, mode, cooldown)| {
+        .map(|(name, indices, mode, query_timeout, attempt_timeout)| {
             let clients: Vec<UpstreamClient> = indices
                 .iter()
                 .filter_map(|&i| match &all_configs[i] {
@@ -917,7 +878,7 @@ pub async fn init(
                     _ => None,
                 })
                 .collect();
-            (name, UpstreamGroup::with_cooldown(clients, mode, cooldown))
+            (name, UpstreamGroup::new(clients, mode, query_timeout, attempt_timeout))
         })
         .collect();
 
@@ -932,6 +893,238 @@ mod tests {
     use std::net::IpAddr;
     use std::str::FromStr;
     use std::time::Duration;
+
+    #[test]
+    fn test_query_budget_config() {
+        let default: config::UpstreamGroupConfig = serde_yaml::from_str("name: test").unwrap();
+        assert_eq!(default.query_timeout.get(), 5);
+        assert_eq!(default.attempt_timeout.get(), 2);
+        let explicit: config::UpstreamGroupConfig =
+            serde_yaml::from_str("name: test\nquery_timeout: 10\nattempt_timeout: 3").unwrap();
+        assert_eq!(explicit.query_timeout.get(), 10);
+        assert_eq!(explicit.attempt_timeout.get(), 3);
+        for field in ["query_timeout", "attempt_timeout"] {
+            for value in ["0", "-1", "65536", "1.5", "null"] {
+                assert!(
+                    serde_yaml::from_str::<config::UpstreamGroupConfig>(&format!("name: test\n{field}: {value}"))
+                        .is_err()
+                );
+            }
+        }
+        let legacy: config::UpstreamGroupConfig = serde_yaml::from_str("name: test\ncooldown: invalid").unwrap();
+        assert_eq!(legacy.attempt_timeout.get(), 2);
+    }
+
+    #[test]
+    fn test_dot_tls_advertises_dot_alpn_without_sni() {
+        let config = dot_tls_client_config();
+        assert_eq!(config.alpn_protocols, vec![b"dot".to_vec()]);
+        assert!(!config.enable_sni);
+        assert!(default_tls_client_config().enable_sni);
+        assert!(default_tls_client_config().alpn_protocols.is_empty());
+    }
+
+    #[test]
+    fn test_transport_error_preserves_classification() {
+        use hickory_net::NetError;
+        assert_eq!(transport_error(NetError::Timeout).kind(), io::ErrorKind::TimedOut);
+        assert_eq!(transport_error(NetError::NoConnections).kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            transport_error(NetError::from(io::Error::from(io::ErrorKind::ConnectionReset))).kind(),
+            io::ErrorKind::ConnectionReset
+        );
+        assert_eq!(transport_error(NetError::Busy).kind(), io::ErrorKind::Other);
+    }
+
+    #[tokio::test]
+    async fn test_group_deadline_includes_connections_and_fallback() {
+        for mode in [
+            QueryModeConfig::Serial,
+            QueryModeConfig::Random,
+            QueryModeConfig::RoundRobin,
+            QueryModeConfig::Parallel,
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let attempts = calls.clone();
+            let factory: conn::ConnFactory = Arc::new(move |_| {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                Box::pin(std::future::pending())
+            });
+            let make_client = || {
+                UpstreamClient::new(ConnectionPool::with_proto(
+                    vec!["127.0.0.1:853".parse().unwrap()],
+                    factory.clone(),
+                    pool::PoolConfig {
+                        connect_timeout: Duration::from_millis(20),
+                        dns_timeout: Duration::from_secs(1),
+                        ..Default::default()
+                    },
+                    "tls",
+                ))
+            };
+            let group = UpstreamGroup::new(
+                vec![make_client(), make_client(), make_client()],
+                mode,
+                Duration::from_millis(35),
+                Duration::from_secs(2),
+            );
+            let msg = make_query_msg("example.com", RecordType::A).unwrap();
+            let error = tokio::time::timeout(Duration::from_secs(1), group.query(&msg))
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            let calls = calls.load(Ordering::Relaxed);
+            if mode == QueryModeConfig::Parallel {
+                assert_eq!(calls, 3);
+            } else {
+                assert!(calls <= 2);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_attempt_timeout_all_modes() {
+        for mode in [
+            QueryModeConfig::Serial,
+            QueryModeConfig::Random,
+            QueryModeConfig::RoundRobin,
+            QueryModeConfig::Parallel,
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let attempts = calls.clone();
+            let factory: conn::ConnFactory = Arc::new(move |_| {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                Box::pin(std::future::pending())
+            });
+            let client = UpstreamClient::new(ConnectionPool::with_proto(
+                vec!["127.0.0.1:853".parse().unwrap()],
+                factory,
+                pool::PoolConfig::default(),
+                "tls",
+            ));
+            let group = UpstreamGroup::new(vec![client], mode, Duration::from_secs(1), Duration::from_millis(20));
+            let msg = make_query_msg("example.com", RecordType::A).unwrap();
+            let start = tokio::time::Instant::now();
+            let error = tokio::time::timeout(Duration::from_millis(300), group.query(&msg))
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{mode:?}");
+            assert!(start.elapsed() >= Duration::from_millis(20), "{mode:?}");
+            assert_eq!(calls.load(Ordering::Relaxed), 1, "{mode:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_attempt_timeout_fallback_all_modes() {
+        for mode in [
+            QueryModeConfig::Serial,
+            QueryModeConfig::Random,
+            QueryModeConfig::RoundRobin,
+            QueryModeConfig::Parallel,
+        ] {
+            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = socket.local_addr().unwrap();
+            let response_task = tokio::spawn(async move {
+                let mut bytes = [0u8; 512];
+                let (len, peer) = socket.recv_from(&mut bytes).await.unwrap();
+                let mut response = Message::from_vec(&bytes[..len]).unwrap();
+                response.metadata.message_type = hickory_proto::op::MessageType::Response;
+                socket.send_to(&response.to_vec().unwrap(), peer).await.unwrap();
+            });
+            let calls = Arc::new(AtomicUsize::new(0));
+            let attempts = calls.clone();
+            let udp_factory = factory::udp_factory();
+            let factory: conn::ConnFactory = Arc::new(move |addr| {
+                if attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                    Box::pin(std::future::pending())
+                } else {
+                    udp_factory(addr)
+                }
+            });
+            let make_client = || {
+                UpstreamClient::new(ConnectionPool::with_proto(
+                    vec![addr],
+                    factory.clone(),
+                    pool::PoolConfig::default(),
+                    "udp",
+                ))
+            };
+            let group = UpstreamGroup::new(
+                vec![make_client(), make_client()],
+                mode,
+                Duration::from_secs(1),
+                Duration::from_millis(100),
+            );
+            let msg = make_query_msg("example.com", RecordType::A).unwrap();
+            let response = tokio::time::timeout(Duration::from_millis(500), group.query(&msg))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(response.metadata.message_type, hickory_proto::op::MessageType::Response);
+            assert_eq!(calls.load(Ordering::Relaxed), 2, "{mode:?}");
+            response_task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dns_attempt_timeout_falls_back() {
+        let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let healthy = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let healthy_addr = healthy.local_addr().unwrap();
+        let response_task = tokio::spawn(async move {
+            let mut bytes = [0u8; 512];
+            let (len, peer) = healthy.recv_from(&mut bytes).await.unwrap();
+            let mut response = Message::from_vec(&bytes[..len]).unwrap();
+            response.metadata.message_type = hickory_proto::op::MessageType::Response;
+            healthy.send_to(&response.to_vec().unwrap(), peer).await.unwrap();
+        });
+        let make_client = |addr| {
+            UpstreamClient::new(ConnectionPool::with_proto(
+                vec![addr],
+                factory::udp_factory(),
+                pool::PoolConfig::default(),
+                "udp",
+            ))
+        };
+        let group = UpstreamGroup::new(
+            vec![make_client(silent.local_addr().unwrap()), make_client(healthy_addr)],
+            QueryModeConfig::Serial,
+            Duration::from_secs(1),
+            Duration::from_millis(100),
+        );
+        let msg = make_query_msg("example.com", RecordType::A).unwrap();
+        let start = tokio::time::Instant::now();
+        tokio::time::timeout(Duration::from_millis(500), group.query(&msg))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(100));
+        let mut bytes = [0u8; 512];
+        assert!(silent.try_recv_from(&mut bytes).is_ok());
+        response_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_deadline_includes_checkout() {
+        let factory: conn::ConnFactory = Arc::new(|_| Box::pin(std::future::pending()));
+        let client = UpstreamClient::new(ConnectionPool::with_proto(
+            vec!["127.0.0.1:853".parse().unwrap()],
+            factory,
+            pool::PoolConfig {
+                dns_timeout: Duration::from_millis(20),
+                ..Default::default()
+            },
+            "tls",
+        ));
+        let msg = make_query_msg("example.com", RecordType::A).unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(1), client.query(&msg))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
 
     #[test]
     fn test_parse_host_port_default_53() {
@@ -1034,76 +1227,14 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_cooldown_spec() {
-        let c = parse_cooldown("1m:10:10s").unwrap().unwrap();
-        assert_eq!(c.window, Duration::from_secs(60));
-        assert_eq!(c.threshold, 10);
-        assert_eq!(c.cooldown, Duration::from_secs(10));
-
-        // Bare numbers = seconds; hours supported.
-        let c = parse_cooldown("30:3:5").unwrap().unwrap();
-        assert_eq!(c.window, Duration::from_secs(30));
-        assert_eq!(c.threshold, 3);
-        assert_eq!(c.cooldown, Duration::from_secs(5));
-
-        let c = parse_cooldown("2h:1:1m").unwrap().unwrap();
-        assert_eq!(c.window, Duration::from_secs(7200));
-        assert_eq!(c.cooldown, Duration::from_secs(60));
-
-        // Empty = disabled; malformed / zero rejected.
-        assert_eq!(parse_cooldown("").unwrap(), None);
-        assert_eq!(parse_cooldown("   ").unwrap(), None);
-        for bad in ["1m:10", "1m:10:10s:extra", "1m:0:10s", "x:1:1s", "1m:1:", "1m:abc:10s"] {
-            assert!(parse_cooldown(bad).is_err(), "should reject: {bad:?}");
-        }
-    }
-
-    #[test]
-    fn test_breaker_trips_on_threshold_within_window() {
-        let cfg = CooldownConfig {
-            window: Duration::from_secs(60),
-            threshold: 3,
-            cooldown: Duration::from_secs(10),
-        };
-        let b = Breaker::new();
-        let now = Instant::now();
-        assert!(!b.in_cooldown(now));
-        b.record_failure(cfg, now);
-        b.record_failure(cfg, now + Duration::from_millis(1));
-        assert!(!b.in_cooldown(now + Duration::from_millis(2)));
-        // Third error within the window trips the breaker.
-        b.record_failure(cfg, now + Duration::from_millis(2));
-        assert!(b.in_cooldown(now + Duration::from_millis(3)));
-        // After cooldown elapses it recovers.
-        assert!(!b.in_cooldown(now + cfg.cooldown + Duration::from_secs(1)));
-        // A success clears the error window.
-        let b2 = Breaker::new();
-        b2.record_failure(cfg, now);
-        b2.record_failure(cfg, now + Duration::from_millis(1));
-        b2.record_success();
-        assert_eq!(b2.errors.lock().len(), 0);
-        assert!(!b2.in_cooldown(now + Duration::from_millis(2)));
-    }
-
-    #[test]
-    fn test_breaker_window_expiry_evicts_old_errors() {
-        let cfg = CooldownConfig {
-            window: Duration::from_secs(5),
-            threshold: 2,
-            cooldown: Duration::from_secs(10),
-        };
-        let b = Breaker::new();
-        let now = Instant::now();
-        b.record_failure(cfg, now);
-        // Old error falls out of the window → second error does not trip.
-        b.record_failure(cfg, now + Duration::from_secs(6));
-        assert!(!b.in_cooldown(now + Duration::from_secs(6)));
-    }
-
-    #[test]
     fn test_group_modes_build_orders() {
         // Round-robin rotates the starting index across calls.
-        let g = UpstreamGroup::with_cooldown(vec![client(), client(), client()], QueryModeConfig::RoundRobin, None);
+        let g = UpstreamGroup::new(
+            vec![client(), client(), client()],
+            QueryModeConfig::RoundRobin,
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+        );
         let o1 = g.round_robin_order();
         let o2 = g.round_robin_order();
         let o3 = g.round_robin_order();
@@ -1112,8 +1243,12 @@ mod tests {
         assert_eq!(o3, vec![2, 0, 1]);
 
         // Random order is always a permutation of all indices.
-        let g =
-            UpstreamGroup::with_cooldown(vec![client(), client(), client(), client()], QueryModeConfig::Random, None);
+        let g = UpstreamGroup::new(
+            vec![client(), client(), client(), client()],
+            QueryModeConfig::Random,
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+        );
         for _ in 0..10 {
             let mut o = g.random_order();
             let mut sorted = o.clone();
@@ -1127,7 +1262,12 @@ mod tests {
         }
 
         // Serial = config order.
-        let g = UpstreamGroup::with_cooldown(vec![client(), client(), client()], QueryModeConfig::Serial, None);
+        let g = UpstreamGroup::new(
+            vec![client(), client(), client()],
+            QueryModeConfig::Serial,
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+        );
         assert_eq!(g.serial_order(), vec![0, 1, 2]);
     }
 

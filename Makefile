@@ -9,6 +9,9 @@ fmt:
 test:
 	cargo test
 
+e2e:
+	bash ./tests/e2e/run_rsdns_tests.sh
+
 check:
 	cargo build
 

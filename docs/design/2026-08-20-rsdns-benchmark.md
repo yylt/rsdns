@@ -63,10 +63,10 @@ rsdns 支持多种上游协议：UDP、TCP、DoT（DNS over TLS）、DoH（DNS o
 
 ### 3.3 为什么“去除 cache”
 
-rsdns 的查询管线为 `hosts → cache → rules → upstream`（`server.rs::do_query`），命中缓存会直接返回、根本不触达上游。性能测试目标是**上游协议的转发能力**，不是缓存命中率，因此：
+rsdns 的查询管线为 `hosts → groups → cache → rules → cloudflare → balance`（`server.rs::handle_query`，rules 直接调用 upstream），命中缓存会直接返回、根本不触达上游。性能测试目标是**上游协议的转发能力**，不是缓存命中率，因此：
 
 - 配置中显式写 `cache.size: 0`：moka 容量为 0 时 map 整体禁用，`get_cached` 恒 `Miss`、`put` 为空操作，从根上关闭缓存（`cache.rs::DnsCache::new`、moka `BaseCache::is_map_disabled`）；
-- 被测规则再叠加 `cache: false`（`rule.rs` 中 forward 动作的 `cache` 字段），`handle_forward` 直接走 `forward_to_upstream`，不查缓存也不写缓存——双保险；
+- benchmark group 包含 `example.com` 和 `--domains` 指定的域名文件（绝对 `file://` 路径），通过 `skip_cache: true` 跳过普通缓存查询和写回；forward 不再支持 `cache` 字段；
 - 每个查询的域名做随机轮换（见 3.4），避免 DNS 响应的 TTL 语义或任何巧合命中干扰。
 
 ### 3.4 负载与域名设计
@@ -116,27 +116,33 @@ benchmark (ubuntu-latest)
 ### 4.3 rsdns 被测配置（模板）
 
 ```yaml
-bind:
-  - address: "0.0.0.0:<PORT>"          # UDP 入站
-upstream:
-  bootstrap:
+binds:
+  - address: "0.0.0.0:<PORT>"
+  - address: "tcp://0.0.0.0:<PORT>"
+groups:
+  - name: benchmark
+    domains: [example.com, 'file:///absolute/path/to/domains.txt']
+    skip_cache: true
+upstreams:
+  - name: bootstrap
     servers:
       - address: 223.5.5.5
-        bootstrap: true
-  default:
+  - name: default
+    query_timeout: 5
+    attempt_timeout: 2
     servers:
-      - address: <UPSTREAM>            # 依次: 223.5.5.5 / tls://dns.pub / https://doh.pub/dns-query / h3://cloudflare-dns.com/dns-query
+      - address: <UPSTREAM>
+        pool:
+          prefer_family: ipv4
 cache:
-  size: 0                              # moka 容量 0 = 完全禁用缓存
+  size: 0
 rules:
-  - match: "*"
-    action:
+  - action:
       type: forward
       upstream: default
-      cache: false                     # 叠加：forward 不查不写缓存
 ```
 
-> `cache.size: 0`（moka 容量为 0 时 map 整体禁用，`get` 恒 miss、`put` 空操作）从根上关闭缓存；规则再叠加 `cache: false` 双保险。`hosts` 为空。bootstrap 仅用于解析 `tls://dns.pub`、`https://doh.pub/dns-query` 等域名型上游（IP 型上游无影响）。
+> group.skip_cache 跳过缓存读写，cache.size: 0 额外禁止存储。未指定域名文件时 group 只包含默认查询域名 example.com（也用于就绪探测）。不配置 hosts、Cloudflare 或 balance。
 
 ### 4.4 单协议基准步骤（脚本内实现）
 
