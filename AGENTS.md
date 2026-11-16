@@ -1,15 +1,5 @@
 # AGENTS.md
 
-## Build
-
-使用 make 目标构建（debug），**不主动构建 release 版本**——release 由 CI/release 流程负责。
-
-```bash
-make build  # debug build rsdns binary
-```
-
-- `target/release/rsdns` is the release binary (built by CI/release, not by hand).
-
 ## Lint & Test
 
 ```bash
@@ -17,7 +7,9 @@ make ci      # run fmt + clippy + check + test
 ```
 
 - `make ci` 是本地完整校验入口（fmt → clippy → check → test），改动后必须通过。
-- 不主动做 smoke test / 手工起服务验证；只需通过 `make ci`。
+- 不主动做 smoke test / 构建二进制验证；只需通过 `make ci`。
+- E2E 位于 `tests/e2e/`，入口为 `./tests/e2e/run_rsdns_tests.sh`，需预先构建 rsdns 二进制。默认读取 `tests/e2e/config.json`，通过 `RSDNS_E2E_CONFIG` 或 runner 的 `-config` 指定 JSON 配置（`default_upstream`、`tests`、`upstreams`）；旧的 `RSDNS_UPSTREAM_*` 环境变量不再生效。脚本切换到 `tests/e2e/` 后读取配置，相对路径以该目录为基准。
+- `.github/workflows/e2e.yaml` 生成独立的临时 JSON 配置，默认解析 / bootstrap 和 DoT、DoH、DoH3、TCP 上游均使用 `1.1.1.1`，不覆盖本地默认配置；DoQ 未配置上游时自动 SKIP。
 
 ## Architecture (high-signal)
 
@@ -29,7 +21,12 @@ make ci      # run fmt + clippy + check + test
   - **Cache records**: A, AAAA, CNAME, MX, TXT, and HTTPS are cached. NXDOMAIN is negatively cached. Hosts and block responses are never cached.
 - **Rules**: ordered by priority. Actions: `block` (NXDomain or poison IP), `cname` (rewrite + recursive resolve), `forward` (named upstream pool, optional TTL override).
 - **Cache**: LRU with configurable capacity, TTL clamping; per-entry TTL via moka `Expiry` — expired entries are evicted automatically (no stale serving; upstream failure → SERVFAIL).
-- **Connection pool**: adaptive weighted address selection, cooldown on failure, SOA health probes, per-address-family preference.
+- **Connection pool**: one shared connection per server, serialized connection establishment, per-IP exponential backoff (2/4/8/16/32s), per-address-family preference; group query_timeout (default 5s) and per-server attempt_timeout (default 2s).
+
+## 配置同步
+
+- 每次修改配置字段、层级、默认值或语义时，必须同步检查并更新 `.github/workflows/` 和 `tests/` 下的配置文件、脚本内嵌配置及生成配置的逻辑；不能只改源码或 `example/` 示例。
+- 对应配置示例、测试断言与使用文档也必须同步，确保 CI、测试和本地示例使用一致的配置格式与语义。
 
 ## Rules
 

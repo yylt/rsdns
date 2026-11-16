@@ -1,8 +1,7 @@
 //! `logs` stage — outermost query logger.
 //!
 //! Wraps the whole pipeline: records the query, runs the rest of the
-//! pipeline, then renders and writes a log line on unwind unless
-//! `ctx.skip_log` was set by a downstream stage.
+//! pipeline, then renders and writes a log line on completion.
 //!
 //! Lines go either to stdout (async, buffered as `bytes::Bytes`) or, when
 //! `log.directory` is set (a plain directory path), appended to
@@ -362,14 +361,12 @@ fn format_answer_types(msg: &Message, out: &mut String) {
 
 struct LogsMetrics {
     queries_total: Counter,
-    skipped_total: Counter,
 }
 
 impl LogsMetrics {
     fn new(registry: &MetricsRegistry) -> Self {
         Self {
             queries_total: registry.counter("rsdns_logs_queries_total", "Logged DNS queries", &["proto"]),
-            skipped_total: registry.counter("rsdns_logs_skipped_total", "Queries skipped due to skip_log", &[]),
         }
     }
 }
@@ -405,20 +402,12 @@ impl Logs {
         self.logger.reopen().await
     }
 
-    /// Writes the query log line after the pipeline completed, unless
-    /// `ctx.skip_log` was set by a downstream stage.
+    /// Writes the query log line after the pipeline completed.
     pub async fn log_query(&self, ctx: &QueryContext) {
         let response = ctx.response.as_ref();
         let rcode = response
             .map(|r| r.metadata.response_code)
             .unwrap_or(ResponseCode::ServFail);
-
-        if ctx.skip_log {
-            if let Some(m) = self.metrics.get() {
-                m.skipped_total.inc();
-            }
-            return;
-        }
 
         let mut answers = String::new();
         if let Some(response) = response {

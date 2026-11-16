@@ -9,7 +9,7 @@ name: benchmark
 # 说明:
 #   - 刻意不使用 Swatinem/rust-cache 等缓存 action，保证每次都是干净构建，
 #     避免缓存命中掩盖构建/依赖变化对性能的影响。
-#   - 查询路径通过 cache.size: 0（moka 容量为 0 时 map 整体禁用）彻底去除缓存。
+#   - 基准域名通过 group.skip_cache: true 跳过缓存查询和写回；cache.size: 0 禁止存储。
 #   - 结果以 PR 评论 + Job 摘要 + Artifact(JSON/CSV) 三路交付。
 
 on:

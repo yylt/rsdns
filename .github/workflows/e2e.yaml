@@ -37,9 +37,18 @@ jobs:
 
       - name: Run rsdns E2E tests
         env:
-          RSDNS_UPSTREAM_DOT: "tls://1.1.1.1:853"
-          RSDNS_UPSTREAM_DOH: "https://1.1.1.1/dns-query"
-          RSDNS_UPSTREAM_DOH3: "h3://1.1.1.1/dns-query"
-          RSDNS_UPSTREAM_TCP: "tcp://1.1.1.1:53"
-          RSDNS_UPSTREAM_DOQ: ""
-        run: ./tests/e2e/run_rsdns_tests.sh
+          RSDNS_E2E_CONFIG: ${{ runner.temp }}/rsdns-e2e.json
+        run: |
+          cat > "$RSDNS_E2E_CONFIG" <<'EOF'
+          {
+            "default_upstream": "1.1.1.1",
+            "tests": ["Forward", "Hosts", "Reject", "DoT", "DoH", "DoH3", "TCP", "DoQ"],
+            "upstreams": {
+              "DoT": "tls://1.1.1.1:853",
+              "DoH": "https://1.1.1.1/dns-query",
+              "DoH3": "h3://1.1.1.1/dns-query",
+              "TCP": "tcp://1.1.1.1:53"
+            }
+          }
+          EOF
+          ./tests/e2e/run_rsdns_tests.sh

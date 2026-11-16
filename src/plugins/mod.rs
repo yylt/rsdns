@@ -15,6 +15,7 @@
 
 pub mod balance;
 pub mod cache;
+pub mod cloudflare;
 pub mod groups;
 pub mod hosts;
 #[cfg(feature = "jemalloc")]

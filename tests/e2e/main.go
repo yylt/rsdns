@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -15,13 +16,65 @@ var (
 	projectRoot string
 	binaryPath  string
 	verbose     bool
+	configPath  string
+	config      E2EConfig
 )
+
+// E2EConfig controls the default resolver, selected cases, and protocol-specific upstreams.
+type E2EConfig struct {
+	DefaultUpstream string            `json:"default_upstream"`
+	Tests           []string          `json:"tests"`
+	Upstreams       map[string]string `json:"upstreams"`
+}
+
+func (c E2EConfig) includes(name string) bool {
+	for _, selected := range c.Tests {
+		if selected == name {
+			return true
+		}
+	}
+	return false
+}
+
+func (c E2EConfig) upstream(name string) string {
+	return c.Upstreams[name]
+}
+
+func loadConfig(path string) (E2EConfig, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return E2EConfig{}, err
+	}
+	var cfg E2EConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return E2EConfig{}, err
+	}
+	if cfg.DefaultUpstream == "" {
+		return E2EConfig{}, fmt.Errorf("default_upstream must not be empty")
+	}
+	known := make(map[string]bool, len(RsdnsTests))
+	for _, test := range RsdnsTests {
+		known[test.Name] = true
+	}
+	for _, name := range cfg.Tests {
+		if !known[name] {
+			return E2EConfig{}, fmt.Errorf("unknown test %q", name)
+		}
+	}
+	for name := range cfg.Upstreams {
+		if !known[name] {
+			return E2EConfig{}, fmt.Errorf("unknown upstream type %q", name)
+		}
+	}
+	return cfg, nil
+}
 
 // errSkip is a sentinel error that signals a test was skipped.
 var errSkip = errors.New("SKIP")
 
 func init() {
 	flag.BoolVar(&verbose, "v", false, "verbose output")
+	flag.StringVar(&configPath, "config", "config.json", "E2E startup configuration")
 	flag.Parse()
 
 	wd, err := os.Getwd()
@@ -35,6 +88,12 @@ func main() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 	log.Printf("[main] Starting rsdns E2E tests")
 	log.Printf("[main] projectRoot=%s verbose=%v", projectRoot, verbose)
+	var err error
+	config, err = loadConfig(configPath)
+	if err != nil {
+		log.Fatalf("[main] load E2E config %s: %v", configPath, err)
+	}
+	log.Printf("[main] config=%s default_upstream=%s tests=%v", configPath, config.DefaultUpstream, config.Tests)
 
 	rsdnsBin := filepath.Join(projectRoot, "target/debug/rsdns")
 	if _, err := os.Stat(rsdnsBin); err != nil {
@@ -49,7 +108,9 @@ func main() {
 	results := &TestResults{}
 
 	for _, t := range RsdnsTests {
-		runTest(results, "rsdns/"+t.Name, t.Fn)
+		if config.includes(t.Name) {
+			runTest(results, "rsdns/"+t.Name, t.Fn)
+		}
 	}
 
 	results.PrintSummary()

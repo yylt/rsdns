@@ -1,0 +1,10 @@
+{
+  "default_upstream": "223.5.5.5",
+  "tests": ["Forward", "Hosts", "Reject", "DoT", "DoH", "DoH3", "TCP", "DoQ"],
+  "upstreams": {
+    "DoT": "tls://dns.alidns.com",
+    "DoH": "https://dns.alidns.com/dns-query",
+    "DoH3": "h3://dns.alidns.com/dns-query",
+    "TCP": "tcp://223.5.5.5"
+  }
+}

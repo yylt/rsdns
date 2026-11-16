@@ -1,5 +1,7 @@
 # rsdns balance 插件：均衡 / 偏好排序 A/AAAA 应答顺序（含 speed 模式）
 
+> 2026-11-16 更新：缓存命中不再跳过 balance；仅 group.skip_balance 控制跳过。Cloudflare 已独立为顶级阶段，详见[后续提案](2026-11-16-rsdns-cloudflare-group-qtype.md)。以下保留历史设计。
+
 > 2026-09-04 | 提案 v2
 >
 > v2 变更（按第二轮评审，合并原 speed 插件）：

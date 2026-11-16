@@ -3,7 +3,7 @@
 //! The pipeline is a fixed sequence of stages (see `server.rs`):
 //!
 //! ```text
-//! logs → hosts → groups → cache → rules
+//! hosts → groups → cache → rules → cloudflare → balance
 //! ```
 //!
 //! `upstream` is **not** a pipeline stage: it is assembled at startup into
@@ -56,15 +56,12 @@ pub struct QueryContext {
     /// Size of the original request in bytes (for query logging).
     pub size: usize,
 
-    // Control bits — stages may flip these.
-    /// When set, the `logs` stage does not print this query.
-    pub skip_log: bool,
+    // Control bits — set only by the groups stage.
     /// When set, the `cache` stage skips both lookup and write-back.
     pub skip_cache: bool,
     /// When set, the `balance` stage skips its whole post-pass (`prefers`
     /// reordering, `mode` processing and `max_answers` truncation; set by
-    /// the groups stage for groups with `skip_balance: true` and by the
-    /// cache stage on a fresh hit).
+    /// the groups stage for groups with `skip_balance: true`).
     pub skip_balance: bool,
 
     // State filled in by stages along the pipeline.
@@ -103,7 +100,6 @@ impl QueryContext {
             start,
             start_time: SystemTime::now(),
             size,
-            skip_log: false,
             skip_cache: false,
             skip_balance: false,
             response: None,

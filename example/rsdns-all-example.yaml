@@ -3,7 +3,7 @@
 # (repo root is the rsdns crate root)
 #
 # Top-level sections: binds[] / groups[] / upstreams[] + plugin sections
-# (hosts / cache / rules / log / ui).  Each plugin owns its own config
+# (hosts / cache / rules / cloudflare / balance / log / ui).  Each plugin owns its own config
 # section and initializes from it.
 
 # Listen addresses: plain IP:port = UDP, tcp:// prefix = TCP.
@@ -49,13 +49,17 @@ groups:
       - cloudflare.com
     skip_cache: true
     # skip_balance: true   # also skip the balance stage's whole post-pass
-    #                      # (prefers / mode / max_answers)
+    #                      # (prefers / mode / max_answers), not Cloudflare
 
 # Upstream pools: named groups of servers.  mode: serial (default) |
 # parallel | random | round_robin.
-# cooldown (optional, per group): "<window>:<errors>:<cooldown>", e.g.
-# "1m:10:10s" = if a server fails 10 times within a 1-minute window, cool it
-# down for 10 seconds (skipped during queries).
+# query_timeout (optional, per group): total seconds including queueing,
+# connections and all fallback attempts; default 5, must be positive.
+# Per-server connect_timeout and the internal 5s DNS timeout remain stage limits.
+# attempt_timeout (optional, per group): per-server seconds including queueing,
+# connection-lock waiting, connection establishment and DNS request; default 2.
+# Each IP backs off 2/4/8/16/32 seconds after connection failures or eviction.
+# DNS success resets backoff; all backed-off addresses fail fast to the next server.
 # IP-address servers are used directly and also serve as the bootstrap
 # resolvers for domain-address servers (which are resolved at startup and
 # use all resolved A+AAAA addresses).
@@ -68,19 +72,20 @@ upstreams:
       - address: 223.5.5.5
   - name: default
     mode: round_robin
-    cooldown: "1m:10:10s"
+    query_timeout: 5
+    attempt_timeout: 2
     servers:
       - address: tls://dot.pub           # TLS — domain resolved via IP servers, all A+AAAA IPs used
         server_name: dns.alidns.com
         pool:
-          # DoT benefits most from multiple long-lived connections.
-          max_size: 8
+          # One shared multiplexed connection, at most 32 in-flight requests.
+          idle_timeout: 30
           prefer_family: ipv4
           connect_timeout: 3
       - address: https://dns.quad9.net/dns-query  # DoH — domain resolved via IP servers
         pool:
-          # DoH already multiplexes over HTTP/2; keep the pool small.
-          max_size: 4
+          # HTTP/2 shares one connection across concurrent requests.
+          idle_timeout: 30
       - address: tls://1.1.1.1           # TLS with static IP
   - name: overseas
     mode: parallel
@@ -96,10 +101,7 @@ cache:
   min_ttl: 60                      # clamp TTL lower bound (seconds)
   max_ttl: 3600                    # clamp TTL upper bound (seconds)
   keep_ttl: false                  # global default: clamp TTL
-  skip_balance: true               # on cache hit, skip balance re-reordering
-                                   # (true: serve order frozen at write-back;
-                                   #  false: re-run prefers/mode/max_answers
-                                   #  on every hit using the current config)
+
 
 # Hosts: suffix-matched static IP mapping (supports file: prefix and wildcard).
 # Two line formats:
@@ -117,6 +119,8 @@ hosts:
   - "file:/etc/hosts"
 
 # Rules: matched in order, first hit stops.
+# qtype: uppercase names only; comma-separated OR match (e.g. "A, AAAA").
+# Omitted or ANY matches all; numeric/lowercase values are invalid.
 # match syntax (no backward compat):
 #   (empty)         → match all
 #   group:{name}    → group reference
@@ -161,10 +165,9 @@ rules:
       ttl: 60       # rewrite response TTL to 60s
       edns: "203.0.113.0/24"   # 固定 EDNS Client Subnet (RFC 7871)，该规则的查询都通告此网段
 
-  # Cloudflare template substitution now lives in the balance stage (see the
-  # `balance.cloudflare` section below), not on the rule action.
+  # Cloudflare template substitution is an independent top-level post-pass.
   - match: "cloudflare-cdn.example.com"
-    qtype: HTTPS
+    qtype: "A, AAAA, HTTPS"
     action:
       type: forward
       upstream: default
@@ -226,17 +229,7 @@ log:
 #                no limit).  Formerly `forward.max_answers`, now global.
 #   speed:       parameters for mode: speed — type "syn" (default), port 443,
 #                timeout 1s (bare seconds or "500ms").
-#   cloudflare:  optional template substitution for answers inside the built-in
-#                Cloudflare IPv4/IPv6 ranges (runs before prefers/mode/cap):
-#                  ech  domain whose HTTPS record provides the `ech` param
-#                  a    domain whose A records replace CF IPv4 answers
-#                  aaaa domain whose AAAA records replace CF IPv6 answers
-#                Each field uses domain@upstream, referencing a configured
-#                upstream group; omit a field to disable that type.
-#                Skipped for DO=1/CD=1 queries.  NOTE: A/AAAA substitution
-#                returns the template domain's addresses — only valid when the
-#                queried name is also served by the same Cloudflare edge.
-# Cache hits and groups with `skip_balance: true` skip the whole post-pass.
+# Only groups with `skip_balance: true` skip this pass; cache hits run it.
 balance:
   mode: round_robin
   max_answers: 5
@@ -248,10 +241,16 @@ balance:
   #   type: syn
   #   port: 443
   #   timeout: 1s
-  # cloudflare:
-  #   ech: "crypto.cloudflare.com@default"
-  #   a: "crypto.cloudflare.com@default"
-  #   aaaa: "crypto.cloudflare.com@default"
+# Independent Cloudflare post-pass, before balance; also runs on cache/hosts
+# responses and for skip_balance/skip_cache groups, even without balance.
+# Optional templates inside built-in CF IPv4/IPv6 ranges, domain@upstream:
+# ech: HTTPS ECH template; a/aaaa: replacement addresses (independent fields).
+# Skipped for DO=1/CD=1. Template failure keeps the original answer.
+# Address substitution assumes the template addresses also serve the query name.
+# cloudflare:
+#   ech: "crypto.cloudflare.com@default"
+#   a: "crypto.cloudflare.com@default"
+#   aaaa: "crypto.cloudflare.com@default"
 
 # Built-in web UI (optional).  Serves two paths on one listener:
 #   /         mobile-friendly HTML dashboard (memory / cache / query metrics,

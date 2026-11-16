@@ -13,30 +13,41 @@ use hickory_proto::op::ResponseCode;
 
 use bytes::Buf;
 use log::{error, info};
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::os::fd::IntoRawFd;
 use std::os::unix::io::FromRawFd;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Instant;
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
-use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::service::service_fn;
 use hyper::{Method, StatusCode};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use socket2::{Domain, Protocol, Socket, Type};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
+use tokio::time::{timeout, Sleep};
 use tokio_rustls::TlsAcceptor;
 
 use crate::plugins::cache::CacheKey;
 use crate::plugins::util::build_servfail;
-use crate::plugins::{balance, cache, groups, hosts, logs, rules};
+use crate::plugins::{balance, cache, cloudflare, groups, hosts, logs, rules};
 use crate::query::{QueryContext, Step};
 
 const MAX_DNS_SIZE: usize = 4096;
+const MAX_REQUEST_SIZE: usize = u16::MAX as usize;
+const MAX_CONNECTIONS: usize = 1024;
+const MAX_REQUESTS: usize = 1024;
+const MAX_STREAMS: usize = 32;
+const IO_TIMEOUT: Duration = Duration::from_secs(5);
+const DOT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The RFC 8484 DNS-over-HTTPS query path.
 const DOH_PATH: &str = "/dns-query";
@@ -50,6 +61,7 @@ pub struct Pipeline {
     pub groups: groups::Groups,
     pub cache: cache::Cache,
     pub rules: rules::Rules,
+    pub cloudflare: cloudflare::Cloudflare,
     pub balance: balance::Balance,
 }
 
@@ -88,6 +100,8 @@ impl ServerMetrics {
 pub struct DnsServer {
     pipeline: Arc<Pipeline>,
     metrics: ServerMetrics,
+    connections: Arc<Semaphore>,
+    requests: Arc<Semaphore>,
 }
 
 impl DnsServer {
@@ -95,6 +109,8 @@ impl DnsServer {
         Self {
             pipeline: Arc::new(pipeline),
             metrics,
+            connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+            requests: Arc::new(Semaphore::new(MAX_REQUESTS)),
         }
     }
 
@@ -183,50 +199,50 @@ impl DnsServer {
 
         loop {
             let (stream, src) = listener.accept().await?;
-            let self_clone = self.clone_inner();
+            let Ok(permit) = self.connections.clone().try_acquire_owned() else {
+                continue;
+            };
+            if let Err(e) = stream.set_nodelay(true) {
+                error!("DoT TCP_NODELAY from {}: {}", src, e);
+                continue;
+            }
+            let server = self.clone_inner();
             let acceptor = acceptor.clone();
             tokio::spawn(async move {
-                let mut stream = match acceptor.accept(stream).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        error!("DoT TLS handshake from {} failed: {}", src, e);
-                        return;
-                    }
-                };
-                if let Err(e) = stream.get_ref().0.set_nodelay(true) {
-                    error!("DoT accept from {} failed to set TCP_NODELAY: {}", src, e);
+                let _permit = permit;
+                let result = async {
+                    let mut stream = timeout(IO_TIMEOUT, acceptor.accept(stream)).await??;
+                    server.handle_dot_stream(&mut stream, src).await
                 }
-                let mut len_buf = [0u8; 2];
-                if let Err(e) = stream.read_exact(&mut len_buf).await {
-                    error!("DoT read len from {}: {}", src, e);
-                    return;
-                }
-                let req_len = u16::from_be_bytes(len_buf) as usize;
-                if req_len > MAX_DNS_SIZE {
-                    error!("DoT request too large from {}: {}", src, req_len);
-                    return;
-                }
-                let mut data = vec![0u8; req_len];
-                if let Err(e) = stream.read_exact(&mut data).await {
-                    error!("DoT read data from {}: {}", src, e);
-                    return;
-                }
-
-                match self_clone.handle_query(&data, src, "tls").await {
-                    Ok(response) => {
-                        let len = (response.len() as u16).to_be_bytes();
-                        if stream.write_all(&len).await.is_err() {
-                            return;
-                        }
-                        if let Err(e) = stream.write_all(&response).await {
-                            error!("Failed to send DoT response to {}: {}", src, e);
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to handle DoT query from {}: {}", src, e);
-                    }
+                .await;
+                if let Err(e) = result {
+                    error!("DoT connection from {}: {}", src, e);
                 }
             });
+        }
+    }
+
+    async fn handle_dot_stream<S: AsyncRead + AsyncWrite + Unpin>(
+        &self,
+        stream: &mut S,
+        src: SocketAddr,
+    ) -> io::Result<()> {
+        loop {
+            let Some(data) = read_dot_message(stream).await? else {
+                return Ok(());
+            };
+            let _permit = self
+                .requests
+                .try_acquire()
+                .map_err(|_| io::Error::other("inbound request limit reached"))?;
+            let response = self.handle_query(&data, src, "tls").await?;
+            let len = u16::try_from(response.len()).map_err(|_| io::Error::other("DNS response too large"))?;
+            timeout(IO_TIMEOUT, async {
+                stream.write_all(&len.to_be_bytes()).await?;
+                stream.write_all(&response).await?;
+                stream.flush().await
+            })
+            .await??;
         }
     }
 
@@ -243,25 +259,48 @@ impl DnsServer {
 
         loop {
             let (stream, src) = listener.accept().await?;
+            let Ok(permit) = self.connections.clone().try_acquire_owned() else {
+                continue;
+            };
+            if let Err(e) = stream.set_nodelay(true) {
+                error!("DoH TCP_NODELAY from {}: {}", src, e);
+                continue;
+            }
             let self_clone = self.clone_inner();
             let acceptor = acceptor.clone();
             tokio::spawn(async move {
-                let tls_stream = match acceptor.accept(stream).await {
-                    Ok(s) => s,
-                    Err(e) => {
+                let _permit = permit;
+                let tls_stream = match timeout(IO_TIMEOUT, acceptor.accept(stream)).await {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => {
                         error!("DoH TLS handshake from {} failed: {}", src, e);
                         return;
                     }
+                    Err(e) => {
+                        error!("DoH TLS handshake from {} timed out: {}", src, e);
+                        return;
+                    }
                 };
-                let io = TokioIo::new(tls_stream);
-                let service = service_fn(move |req| {
-                    let server = self_clone.clone_inner();
-                    async move { Ok::<_, io::Error>(server.handle_doh_request(req, src, "doh").await) }
+                let io = TokioIo::new(WriteDeadline {
+                    inner: tls_stream,
+                    deadline: None,
                 });
-                if let Err(e) = AutoBuilder::new(TokioExecutor::new())
-                    .serve_connection(io, service)
-                    .await
-                {
+                let streams = Arc::new(Semaphore::new(MAX_STREAMS));
+                let service = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                    let server = self_clone.clone_inner();
+                    let permit = streams.clone().try_acquire_owned();
+                    async move {
+                        let response = match permit {
+                            Ok(_permit) => server.handle_doh_request(req, src, "doh").await,
+                            Err(_) => http_error(StatusCode::SERVICE_UNAVAILABLE),
+                        };
+                        Ok::<_, io::Error>(response)
+                    }
+                });
+                let mut builder = AutoBuilder::new(TokioExecutor::new());
+                builder.http1().timer(TokioTimer::new()).header_read_timeout(IO_TIMEOUT);
+                builder.http2().max_concurrent_streams(MAX_STREAMS as u32);
+                if let Err(e) = builder.serve_connection(io, service).await {
                     error!("DoH connection from {} closed with error: {}", src, e);
                 }
             });
@@ -280,81 +319,122 @@ impl DnsServer {
             .map_err(|e| io::Error::other(e.to_string()))?;
 
         loop {
-            let Some((mut conn, src)) = server.accept().await.map_err(|e| io::Error::other(e.to_string()))? else {
-                error!("DoH3 accept returned None on {}", addr);
+            let (mut conn, src) = match server.accept().await {
+                Ok(Some(connection)) => connection,
+                Ok(None) => return Ok(()),
+                Err(e) => {
+                    error!("DoH3 handshake on {} failed: {}", addr, e);
+                    continue;
+                }
+            };
+            let Ok(permit) = self.connections.clone().try_acquire_owned() else {
                 continue;
             };
-            let self_clone = self.clone_inner();
+            let server = self.clone_inner();
             tokio::spawn(async move {
-                while let Some(req) = conn.accept().await {
-                    match req {
-                        Ok((request, mut stream)) => {
-                            // 与 DoH 相同的 RFC 8484 语义，只是 body 来自
-                            // HTTP/3 的 RequestStream。
-                            let method = request.method().clone();
-                            let uri = request.uri().clone();
-                            let content_type = request
-                                .headers()
-                                .get(hyper::header::CONTENT_TYPE)
-                                .and_then(|v| v.to_str().ok())
-                                .map(|s| s.to_string());
-
-                            let mut body = Vec::new();
-                            let mut body_ok = true;
-                            loop {
-                                match stream.recv_data().await {
-                                    Ok(Some(buf)) => {
-                                        let mut buf = buf;
-                                        body.extend_from_slice(&buf.copy_to_bytes(buf.remaining()));
-                                    }
-                                    Ok(None) => break,
-                                    Err(e) => {
-                                        error!("DoH3 read body from {}: {}", src, e);
-                                        body_ok = false;
-                                        break;
-                                    }
-                                }
-                            }
-                            let body = if body_ok { Some(body) } else { None };
-
-                            let response = self_clone
-                                .handle_doh_wire(method, uri, content_type, body, src, "doh3")
-                                .await;
-                            let status = response.status();
-                            let content_type = response
-                                .headers()
-                                .get(hyper::header::CONTENT_TYPE)
-                                .and_then(|v| v.to_str().ok())
-                                .map(|s| s.to_string());
-                            let body = response.into_body();
-                            let mut h3_resp = hyper::Response::builder().status(status);
-                            if let Some(ct) = content_type {
-                                h3_resp = h3_resp.header(hyper::header::CONTENT_TYPE, ct);
-                            }
-                            if let Err(e) = stream.send_response(h3_resp.body(()).unwrap()).await {
-                                error!("DoH3 send response headers to {}: {}", src, e);
-                                continue;
-                            }
-                            match body.collect().await {
-                                Ok(collected) => {
-                                    let bytes = collected.to_bytes();
-                                    if !bytes.is_empty() && stream.send_data(bytes).await.is_err() {
-                                        continue;
-                                    }
-                                    if let Err(e) = stream.finish().await {
-                                        error!("DoH3 finish stream to {}: {}", src, e);
-                                    }
-                                }
-                                Err(e) => {
-                                    error!("DoH3 collect response body for {}: {}", src, e);
-                                }
+                let _permit = permit;
+                let mut tasks = JoinSet::new();
+                loop {
+                    while tasks.try_join_next().is_some() {}
+                    // accept also resolves headers and is not cancellation-safe.
+                    // Reap children without dropping/restarting the pending accept.
+                    let request = {
+                        let accept = conn.accept();
+                        tokio::pin!(accept);
+                        loop {
+                            tokio::select! {
+                                request = &mut accept => break request,
+                                _ = tasks.join_next(), if !tasks.is_empty() => {}
                             }
                         }
+                    };
+                    let Some(request) = request else { break };
+                    let (request, mut stream) = match request {
+                        Ok(request) => request,
                         Err(e) => {
-                            error!("DoH3 request from {} failed: {}", src, e);
+                            error!("DoH3 request from {}: {}", src, e);
+                            break;
                         }
+                    };
+                    if tasks.len() >= MAX_STREAMS {
+                        stream.stop_sending(0x10c_u64.into()); // H3_REQUEST_CANCELLED
+                        let response = hyper::Response::builder()
+                            .status(StatusCode::SERVICE_UNAVAILABLE)
+                            .body(())
+                            .unwrap();
+                        let _ = timeout(IO_TIMEOUT, async {
+                            stream.send_response(response).await?;
+                            stream.finish().await
+                        })
+                        .await;
+                        continue;
                     }
+                    let server = server.clone_inner();
+                    tasks.spawn(async move {
+                        let (parts, ()) = request.into_parts();
+                        let content_type = parts
+                            .headers
+                            .get(hyper::header::CONTENT_TYPE)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_owned);
+                        let permit = server.requests.try_acquire();
+                        let response = if let Some(status) =
+                            validate_doh_route(&parts.method, &parts.uri, content_type.as_deref())
+                        {
+                            http_error(status)
+                        } else if permit.is_err() {
+                            http_error(StatusCode::SERVICE_UNAVAILABLE)
+                        } else {
+                            let body = if parts.method == Method::POST {
+                                match timeout(IO_TIMEOUT, async {
+                                    let mut body = Vec::new();
+                                    while let Some(mut chunk) =
+                                        stream.recv_data().await.map_err(|_| StatusCode::BAD_REQUEST)?
+                                    {
+                                        if chunk.remaining() > MAX_REQUEST_SIZE - body.len() {
+                                            return Err(StatusCode::PAYLOAD_TOO_LARGE);
+                                        }
+                                        body.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+                                    }
+                                    Ok(body)
+                                })
+                                .await
+                                {
+                                    Ok(body) => body,
+                                    Err(_) => Err(StatusCode::REQUEST_TIMEOUT),
+                                }
+                            } else {
+                                Ok(Vec::new())
+                            };
+                            match body {
+                                Ok(body) => {
+                                    server
+                                        .handle_doh_wire(parts.method, parts.uri, content_type, Some(body), src, "doh3")
+                                        .await
+                                }
+                                Err(status) => http_error(status),
+                            }
+                        };
+                        // Stop unused/failed request bodies without preventing a response.
+                        stream.stop_sending(0x10c_u64.into());
+                        let (parts, body) = response.into_parts();
+                        let response = hyper::Response::from_parts(parts, ());
+                        let body = body.collect().await.unwrap().to_bytes();
+                        let result = timeout(IO_TIMEOUT, async {
+                            stream.send_response(response).await?;
+                            if !body.is_empty() {
+                                stream.send_data(body).await?;
+                            }
+                            stream.finish().await
+                        })
+                        .await;
+                        if !matches!(result, Ok(Ok(()))) {
+                            error!("DoH3 response to {} failed or timed out", src);
+                        }
+                    });
                 }
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
             });
         }
     }
@@ -363,12 +443,16 @@ impl DnsServer {
     /// `POST /dns-query` with `Content-Type: application/dns-message`, or
     /// `GET /dns-query?dns=<base64url no padding>`.  Other paths → 404;
     /// wrong content type on POST → 415; missing/invalid query → 400.
-    async fn handle_doh_request(
+    async fn handle_doh_request<B>(
         &self,
-        req: hyper::Request<Incoming>,
+        req: hyper::Request<B>,
         src: SocketAddr,
         proto: &'static str,
-    ) -> hyper::Response<Full<bytes::Bytes>> {
+    ) -> hyper::Response<Full<bytes::Bytes>>
+    where
+        B: hyper::body::Body + Unpin,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
         let method = req.method().clone();
         let uri = req.uri().clone();
         let content_type = req
@@ -377,14 +461,20 @@ impl DnsServer {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
-        // POST body 读取失败 → 400。
+        if let Some(status) = validate_doh_route(&method, &uri, content_type.as_deref()) {
+            return http_error(status);
+        }
+        let Ok(_permit) = self.requests.try_acquire() else {
+            return http_error(StatusCode::SERVICE_UNAVAILABLE);
+        };
         let body = if method == Method::POST {
-            match req.into_body().collect().await {
-                Ok(collected) => Some(collected.to_bytes().to_vec()),
-                Err(e) => {
-                    error!("DoH read body from {}: {}", src, e);
-                    None
+            match timeout(IO_TIMEOUT, Limited::new(req.into_body(), MAX_REQUEST_SIZE).collect()).await {
+                Ok(Ok(collected)) => Some(collected.to_bytes().to_vec()),
+                Ok(Err(e)) if e.is::<http_body_util::LengthLimitError>() => {
+                    return http_error(StatusCode::PAYLOAD_TOO_LARGE)
                 }
+                Ok(Err(_)) => return http_error(StatusCode::BAD_REQUEST),
+                Err(_) => return http_error(StatusCode::REQUEST_TIMEOUT),
             }
         } else {
             None
@@ -405,38 +495,25 @@ impl DnsServer {
         proto: &'static str,
     ) -> hyper::Response<Full<bytes::Bytes>> {
         let mut resp = hyper::Response::new(Full::new(bytes::Bytes::new()));
-        if uri.path() != DOH_PATH {
-            *resp.status_mut() = StatusCode::NOT_FOUND;
-            return resp;
+        if let Some(status) = validate_doh_route(&method, &uri, content_type.as_deref()) {
+            return http_error(status);
         }
-
-        let data: Option<Vec<u8>> = match method {
-            Method::POST => {
-                match content_type.as_deref() {
-                    Some(c) if c.eq_ignore_ascii_case(DNS_MESSAGE) => {}
-                    _ => {
-                        *resp.status_mut() = StatusCode::UNSUPPORTED_MEDIA_TYPE;
-                        return resp;
-                    }
-                }
-                body
-            }
-            Method::GET => {
-                let q = uri
-                    .query()
-                    .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("dns=")).map(percent_decode));
-                q.and_then(|v| decode_base64url(&v))
-            }
-            _ => {
-                *resp.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
-                return resp;
-            }
+        let data = match method {
+            Method::POST => body,
+            Method::GET => uri
+                .query()
+                .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("dns=")).map(percent_decode))
+                .and_then(|v| decode_base64url(&v)),
+            _ => unreachable!(),
         };
-
         let Some(data) = data else {
             *resp.status_mut() = StatusCode::BAD_REQUEST;
             return resp;
         };
+
+        if data.len() > MAX_REQUEST_SIZE {
+            return http_error(StatusCode::PAYLOAD_TOO_LARGE);
+        }
 
         match self.handle_query(&data, src, proto).await {
             Ok(response) => {
@@ -458,6 +535,8 @@ impl DnsServer {
         Self {
             pipeline: self.pipeline.clone(),
             metrics: self.metrics.clone(),
+            connections: self.connections.clone(),
+            requests: self.requests.clone(),
         }
     }
 
@@ -532,8 +611,11 @@ impl DnsServer {
             ctx.response = Some(build_servfail(&ctx.msg));
         }
 
-        // balance 阶段：按 prefers / mode 重排 A/AAAA 并可选截断（后置
-        // pass，不短路）；缓存命中与 skip_balance 组在阶段内直接放行。
+        // Cloudflare always sees the final response, including hosts/cache hits
+        // and groups that skip cache or balance. Substituted records are then balanced.
+        self.pipeline.cloudflare.handle(&mut ctx).await;
+
+        // balance is a post-pass; only the matched group may bypass it.
         self.pipeline.balance.handle(&mut ctx).await;
 
         // hosts 别名无 IP 分支：解析目标被改写为原域名，最终应答按客户端
@@ -622,6 +704,91 @@ impl DnsServer {
     }
 }
 
+// A whole write/flush burst has one deadline, even when the peer only
+// accepts small fragments. Idle keep-alive time does not start this clock.
+struct WriteDeadline<S> {
+    inner: S,
+    deadline: Option<Pin<Box<Sleep>>>,
+}
+
+impl<S: Unpin> WriteDeadline<S> {
+    fn poll_deadline(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
+        let deadline = self
+            .deadline
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(IO_TIMEOUT)));
+        if deadline.as_mut().poll(cx).is_ready() {
+            Err(io::Error::new(io::ErrorKind::TimedOut, "DoH write timed out"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for WriteDeadline<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for WriteDeadline<S> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        self.poll_deadline(cx)?;
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_deadline(cx)?;
+        let result = Pin::new(&mut self.inner).poll_flush(cx);
+        if result.is_ready() {
+            self.deadline = None;
+        }
+        result
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_deadline(cx)?;
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+async fn read_dot_message<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<Option<Vec<u8>>> {
+    let mut len = [0; 2];
+    // No bytes is a clean EOF. Once the first byte arrives, the entire
+    // remaining header and body share one budget (not one per fragment).
+    if timeout(DOT_IDLE_TIMEOUT, stream.read(&mut len[..1])).await?? == 0 {
+        return Ok(None);
+    }
+    timeout(IO_TIMEOUT, async {
+        stream.read_exact(&mut len[1..]).await?;
+        let mut data = vec![0; u16::from_be_bytes(len) as usize];
+        stream.read_exact(&mut data).await?;
+        Ok(Some(data))
+    })
+    .await?
+}
+
+fn validate_doh_route(method: &Method, uri: &hyper::Uri, content_type: Option<&str>) -> Option<StatusCode> {
+    if uri.path() != DOH_PATH {
+        Some(StatusCode::NOT_FOUND)
+    } else if method != Method::GET && method != Method::POST {
+        Some(StatusCode::METHOD_NOT_ALLOWED)
+    } else if method == Method::POST && !content_type.is_some_and(|c| c.eq_ignore_ascii_case(DNS_MESSAGE)) {
+        Some(StatusCode::UNSUPPORTED_MEDIA_TYPE)
+    } else {
+        None
+    }
+}
+
+fn http_error(status: StatusCode) -> hyper::Response<Full<bytes::Bytes>> {
+    let mut response = hyper::Response::new(Full::new(bytes::Bytes::new()));
+    *response.status_mut() = status;
+    response
+}
+
 /// RFC 4648 base64url without padding (used for the DoH `?dns=` parameter).
 ///
 /// `+` and `/` are already URL-safe here (a raw URI query is percent-encoded
@@ -689,7 +856,7 @@ mod tests {
     use crate::common::tls::{generate_self_signed, load_server_config};
     use crate::config::Config;
     use crate::plugins::util::make_query_msg;
-    use crate::plugins::{balance, cache, groups, hosts, logs, rules};
+    use crate::plugins::{balance, cache, cloudflare, groups, hosts, logs, rules};
     use crate::upstream;
     use crate::upstream::conn::exchange_from;
     use hickory_net::runtime::TokioRuntimeProvider;
@@ -710,15 +877,20 @@ mod tests {
     /// A server whose pipeline answers `test.example` from hosts (no
     /// upstream / network needed).
     async fn test_server() -> Arc<DnsServer> {
+        test_server_config("hosts:\n  - \"127.0.0.1 test.example\"\nupstreams: []\n").await
+    }
+
+    async fn test_server_config(yaml: &str) -> Arc<DnsServer> {
         let metrics = crate::metrics::MetricsRegistry::new();
-        let config = Config::from_yaml_str("hosts:\n  - \"127.0.0.1 test.example\"\nupstreams: []\n").unwrap();
+        let config = Config::from_yaml_str(yaml).unwrap();
         let logs = logs::init(&config, &metrics).await.unwrap();
         let hosts = hosts::init(&config, &metrics);
         let groups = groups::init(&config, &metrics);
         let cache = cache::init(&config, &metrics);
-        let mut balance = balance::init(&config);
+        let balance = balance::init(&config);
+        let mut cloudflare = cloudflare::init(&config);
         let upstreams = upstream::init(&config, &metrics, &hosts, &balance).await.unwrap();
-        balance.attach_upstreams(upstreams.clone());
+        cloudflare.attach_upstreams(upstreams.clone());
         let rules = rules::init(&config, &metrics, upstreams).unwrap();
         Arc::new(DnsServer::new(
             Pipeline {
@@ -727,10 +899,101 @@ mod tests {
                 groups,
                 cache,
                 rules,
+                cloudflare,
                 balance,
             },
             ServerMetrics::new(&metrics),
         ))
+    }
+
+    async fn check_cloudflare_postpass(source: &str, options: &str, expected: &[&str]) {
+        use hickory_proto::rr::rdata::A;
+        use hickory_proto::rr::{RData, Record};
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let responder = tokio::spawn(async move {
+            let mut buf = [0; MAX_DNS_SIZE];
+            loop {
+                let (len, peer) = socket.recv_from(&mut buf).await.unwrap();
+                let request = Message::from_vec(&buf[..len]).unwrap();
+                let is_template = request.queries[0].name().to_utf8() == "template.example.";
+                let mut response = crate::plugins::util::build_servfail(&request);
+                response.metadata.response_code = ResponseCode::NoError;
+                let ips = if is_template {
+                    vec!["192.0.2.2", "192.0.2.1"]
+                } else {
+                    vec!["104.16.0.1"]
+                };
+                for ip in ips {
+                    response.answers.push(Record::from_rdata(
+                        request.queries[0].name().clone(),
+                        300,
+                        RData::A(A(ip.parse().unwrap())),
+                    ));
+                }
+                socket.send_to(&response.to_vec().unwrap(), peer).await.unwrap();
+            }
+        });
+        timeout(IO_TIMEOUT, async {
+                let hosts = if source == "hosts" { "hosts:\n  - \"104.16.0.1 test.example\"\n" } else { "" };
+                let server = test_server_config(&format!(
+                    "{hosts}{options}cloudflare:\n  a: template.example@local\nupstreams:\n  - name: local\n    servers: [{{ address: {addr} }}]\n",
+                )).await;
+                if source == "cache" {
+                    let msg = make_query_msg("test.example", RecordType::A).unwrap();
+                    let mut ctx = QueryContext::new(msg.clone(), CacheKey::new("test.example", RecordType::A),
+                        "127.0.0.1:1".parse().unwrap(), "udp", Instant::now(), 0);
+                    let mut response = crate::plugins::util::build_servfail(&msg);
+                    response.metadata.response_code = ResponseCode::NoError;
+                    response.answers.push(Record::from_rdata(msg.queries[0].name().clone(), 300,
+                        RData::A(A("104.16.0.1".parse().unwrap()))));
+                    ctx.response = Some(response);
+                    ctx.action = "forward".into();
+                    server.pipeline.cache.write_back(&ctx).await;
+                }
+                for _ in 0..2 {
+                    let response = server.handle_query(&test_query("test.example"), "127.0.0.1:1".parse().unwrap(), "udp").await.unwrap();
+                    let response = Message::from_vec(&response).unwrap();
+                    let ips: Vec<_> = response.answers.iter().map(|r| match &r.data {
+                        RData::A(a) => a.0.to_string(),
+                        other => panic!("unexpected answer {other:?}"),
+                    }).collect();
+                    assert_eq!(ips, expected, "{source}: {options}");
+                }
+        }).await.unwrap();
+        responder.abort();
+        let _ = responder.await;
+    }
+
+    #[tokio::test]
+    async fn test_cloudflare_hosts_without_balance() {
+        check_cloudflare_postpass("hosts", "", &["192.0.2.2", "192.0.2.1"]).await;
+    }
+
+    #[tokio::test]
+    async fn test_cloudflare_cache_without_balance() {
+        check_cloudflare_postpass("cache", "", &["192.0.2.2", "192.0.2.1"]).await;
+    }
+
+    #[tokio::test]
+    async fn test_cloudflare_cache_group_skips_balance() {
+        check_cloudflare_postpass("cache", "groups:\n  - name: bypass\n    domains: [test.example]\n    skip_balance: true\nbalance:\n  max_answers: 1\n", &["192.0.2.2", "192.0.2.1"]).await;
+    }
+
+    #[tokio::test]
+    async fn test_cloudflare_cache_before_balance() {
+        check_cloudflare_postpass(
+            "cache",
+            "balance:\n  prefers: [192.0.2.1/32]\n  max_answers: 1\n",
+            &["192.0.2.1"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_cloudflare_rules_group_skips_cache() {
+        check_cloudflare_postpass("rules", "groups:\n  - name: bypass\n    domains: [test.example]\n    skip_cache: true\n    skip_balance: true\nbalance:\n  max_answers: 1\nrules:\n  - match: '*'\n    action: { type: forward, upstream: local }\n", &["192.0.2.2", "192.0.2.1"]).await;
     }
 
     /// Server TLS config + a client config that trusts the same cert.
@@ -798,21 +1061,23 @@ mod tests {
             .await
             .unwrap();
 
-        let query = test_query("test.example");
-        tls.write_all(&(query.len() as u16).to_be_bytes()).await.unwrap();
-        tls.write_all(&query).await.unwrap();
-        tls.flush().await.unwrap();
+        for _ in 0..2 {
+            let query = test_query("test.example");
+            tls.write_all(&(query.len() as u16).to_be_bytes()).await.unwrap();
+            tls.write_all(&query).await.unwrap();
+            tls.flush().await.unwrap();
 
-        let mut len_buf = [0u8; 2];
-        tls.read_exact(&mut len_buf).await.unwrap();
-        let resp_len = u16::from_be_bytes(len_buf) as usize;
-        let mut resp = vec![0u8; resp_len];
-        tls.read_exact(&mut resp).await.unwrap();
+            let mut len_buf = [0u8; 2];
+            tls.read_exact(&mut len_buf).await.unwrap();
+            let resp_len = u16::from_be_bytes(len_buf) as usize;
+            let mut resp = vec![0u8; resp_len];
+            tls.read_exact(&mut resp).await.unwrap();
 
-        let msg = Message::from_vec(&resp).unwrap();
-        assert_eq!(msg.answers.len(), 1);
-        let a = &msg.answers[0];
-        assert_eq!(a.name.to_utf8(), "test.example.");
+            let msg = Message::from_vec(&resp).unwrap();
+            assert_eq!(msg.answers.len(), 1);
+            let a = &msg.answers[0];
+            assert_eq!(a.name.to_utf8(), "test.example.");
+        }
     }
 
     /// DoH over HTTP/1.1: hand-crafted POST /dns-query.
@@ -921,20 +1186,37 @@ mod tests {
             srv.serve_doh3(socket, tls, addr).await.unwrap();
         });
 
+        let untrusted = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        assert!(timeout(
+            IO_TIMEOUT,
+            hickory_net::h3::H3ClientStream::builder()
+                .crypto_config(untrusted)
+                .build(addr, Arc::<str>::from("127.0.0.1"), Arc::<str>::from(DOH_PATH))
+        )
+        .await
+        .unwrap()
+        .is_err());
+
         let stream = hickory_net::h3::H3ClientStream::builder()
             .crypto_config(client_cfg)
             .build(addr, Arc::<str>::from("127.0.0.1"), Arc::<str>::from("/dns-query"))
             .await
             .unwrap();
         let exchange = exchange_from(stream);
-        let resp = exchange
-            .send(DnsRequest::new(
-                make_query_msg("test.example", RecordType::A).unwrap(),
-                DnsRequestOptions::default(),
-            ))
-            .first_answer()
-            .await
-            .unwrap();
+        let resp = timeout(
+            IO_TIMEOUT,
+            exchange
+                .send(DnsRequest::new(
+                    make_query_msg("test.example", RecordType::A).unwrap(),
+                    DnsRequestOptions::default(),
+                ))
+                .first_answer(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(resp.answers.len(), 1);
     }
 
@@ -992,5 +1274,139 @@ mod tests {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let msg = Message::from_vec(&body).unwrap();
         assert_eq!(msg.answers.len(), 1);
+    }
+    #[tokio::test]
+    async fn test_doh_body_boundaries_and_early_route() {
+        let server = test_server().await;
+        let src = "127.0.0.1:5353".parse().unwrap();
+        for (path, ct, size, status) in [
+            (DOH_PATH, DNS_MESSAGE, MAX_REQUEST_SIZE, StatusCode::BAD_REQUEST),
+            (DOH_PATH, DNS_MESSAGE, MAX_REQUEST_SIZE + 1, StatusCode::PAYLOAD_TOO_LARGE),
+            ("/other", DNS_MESSAGE, MAX_REQUEST_SIZE + 1, StatusCode::NOT_FOUND),
+            (DOH_PATH, "text/plain", MAX_REQUEST_SIZE + 1, StatusCode::UNSUPPORTED_MEDIA_TYPE),
+        ] {
+            let request = hyper::Request::post(path)
+                .header(hyper::header::CONTENT_TYPE, ct)
+                .body(Full::new(bytes::Bytes::from(vec![0; size])))
+                .unwrap();
+            assert_eq!(server.handle_doh_request(request, src, "doh").await.status(), status);
+        }
+        let permits = server.requests.acquire_many(MAX_REQUESTS as u32).await.unwrap();
+        let request = hyper::Request::get(DOH_PATH)
+            .body(Full::new(bytes::Bytes::new()))
+            .unwrap();
+        assert_eq!(
+            server.handle_doh_request(request, src, "doh").await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        drop(permits);
+        assert_eq!(server.requests.available_permits(), MAX_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn test_dot_frame_eof_and_truncation() {
+        let mut empty = &b""[..];
+        assert!(read_dot_message(&mut empty).await.unwrap().is_none());
+        for frame in [&b"\x00"[..], &b"\x00\x02x"[..]] {
+            let mut frame = frame;
+            assert_eq!(
+                read_dot_message(&mut frame).await.unwrap_err().kind(),
+                io::ErrorKind::UnexpectedEof
+            );
+        }
+        let mut frame = vec![255, 255];
+        frame.resize(MAX_REQUEST_SIZE + 2, 0);
+        assert_eq!(
+            read_dot_message(&mut frame.as_slice()).await.unwrap().unwrap().len(),
+            MAX_REQUEST_SIZE
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dot_request_limit_closes_connection() {
+        let server = test_server().await;
+        let (mut client, mut stream) = tokio::io::duplex(64);
+        let permits = server.requests.acquire_many(MAX_REQUESTS as u32).await.unwrap();
+        let srv = server.clone();
+        let task =
+            tokio::spawn(async move { srv.handle_dot_stream(&mut stream, "127.0.0.1:1".parse().unwrap()).await });
+        let query = test_query("test.example");
+        client.write_all(&(query.len() as u16).to_be_bytes()).await.unwrap();
+        client.write_all(&query).await.unwrap();
+        assert!(timeout(IO_TIMEOUT, task).await.unwrap().unwrap().is_err());
+        drop(permits);
+        assert_eq!(server.requests.available_permits(), MAX_REQUESTS);
+    }
+    #[tokio::test]
+    async fn test_dropped_request_tasks_release_permits() {
+        let permits = Arc::new(Semaphore::new(MAX_STREAMS));
+        let mut tasks = JoinSet::new();
+        for _ in 0..MAX_STREAMS {
+            let permit = permits.clone().try_acquire_owned().unwrap();
+            tasks.spawn(async move {
+                let _permit = permit;
+                std::future::pending::<()>().await;
+            });
+        }
+        assert!(permits.try_acquire().is_err());
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        assert_eq!(permits.available_permits(), MAX_STREAMS);
+    }
+    #[tokio::test]
+    async fn test_doh3_slow_query_does_not_block_fast_query() {
+        timeout(IO_TIMEOUT, async {
+            let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let server = test_server_config(&format!(
+                "hosts:\n  - \"127.0.0.1 test.example\"\nupstreams:\n  - name: local\n    servers:\n      - address: {}\nrules:\n  - match: \"\"\n    action: {{ type: forward, upstream: local }}\n",
+                upstream.local_addr().unwrap()
+            )).await;
+            let (tls, client) = test_tls_pair();
+            let socket = server.bind_udp("127.0.0.1:0".parse().unwrap()).await.unwrap();
+            let addr = socket.local_addr().unwrap();
+            let srv = server.clone();
+            let listener = tokio::spawn(async move { srv.serve_doh3(socket, tls, addr).await });
+            let stream = hickory_net::h3::H3ClientStream::builder().crypto_config(client)
+                .build(addr, Arc::<str>::from("127.0.0.1"), Arc::<str>::from(DOH_PATH)).await.unwrap();
+            let exchange = exchange_from(stream);
+            let slow_exchange = exchange.clone();
+            let slow = tokio::spawn(async move {
+                slow_exchange.send(DnsRequest::new(make_query_msg("slow.example", RecordType::A).unwrap(), DnsRequestOptions::default()))
+                    .first_answer().await
+            });
+            let mut buf = [0; MAX_DNS_SIZE];
+            upstream.recv_from(&mut buf).await.unwrap();
+            let fast = exchange.send(DnsRequest::new(make_query_msg("test.example", RecordType::A).unwrap(), DnsRequestOptions::default()))
+                .first_answer().await.unwrap();
+            assert_eq!(fast.answers.len(), 1);
+            assert!(!slow.is_finished());
+            slow.abort();
+            let _ = slow.await;
+            listener.abort();
+            let _ = listener.await;
+        }).await.unwrap();
+    }
+    #[tokio::test]
+    async fn test_doh_write_and_body_deadlines() {
+        let server = test_server().await;
+        let (tx, rx) = tokio::sync::mpsc::channel::<()>(1);
+        let body = http_body_util::StreamBody::new(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv()
+                .await
+                .map(|_| (Ok::<_, io::Error>(hyper::body::Frame::data(bytes::Bytes::new())), rx))
+        }));
+        let request = hyper::Request::post(DOH_PATH)
+            .header(hyper::header::CONTENT_TYPE, DNS_MESSAGE)
+            .body(Box::pin(body))
+            .unwrap();
+        let (inner, _peer) = tokio::io::duplex(1);
+        let mut writer = WriteDeadline { inner, deadline: None };
+        let write = async { writer.write_all(&[1, 2]).await.unwrap_err().kind() };
+        let (write, response) =
+            tokio::join!(write, server.handle_doh_request(request, "127.0.0.1:1".parse().unwrap(), "doh"));
+        assert_eq!(write, io::ErrorKind::TimedOut);
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        drop(tx);
+        assert_eq!(server.requests.available_permits(), MAX_REQUESTS);
     }
 }

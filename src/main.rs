@@ -110,14 +110,15 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let metrics = metrics::MetricsRegistry::new();
 
     // 2. 初始化各管道阶段（固定顺序；groups 为前置阶段；upstreams 组装后
-    //    注入 rules（forward/cname）与 balance（Cloudflare 模板查询））。
+    //    注入 rules（forward/cname）与 cloudflare（模板查询））。
     let logs = plugins::logs::init(&config, &metrics).await?;
     let hosts = plugins::hosts::init(&config, &metrics);
     let groups = plugins::groups::init(&config, &metrics);
     let cache = plugins::cache::init(&config, &metrics);
-    let mut balance = plugins::balance::init(&config);
+    let balance = plugins::balance::init(&config);
+    let mut cloudflare = plugins::cloudflare::init(&config);
     let upstreams = upstream::init(&config, &metrics, &hosts, &balance).await?;
-    balance.attach_upstreams(upstreams.clone());
+    cloudflare.attach_upstreams(upstreams.clone());
     let rules = plugins::rules::init(&config, &metrics, upstreams)?;
 
     let pipeline = Pipeline {
@@ -126,6 +127,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         groups,
         cache,
         rules,
+        cloudflare,
         balance,
     };
     let server_metrics = server::ServerMetrics::new(&metrics);

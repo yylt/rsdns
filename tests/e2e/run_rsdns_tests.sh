@@ -27,15 +27,9 @@ go build -o test_runner . || exit 1
 echo "✓ Test runner built"
 echo ""
 
-echo "Starting rsdns tests..."
-echo "  RSDNS_UPSTREAM_UDP  = ${RSDNS_UPSTREAM_UDP:-1.1.1.1}"
-echo "  RSDNS_UPSTREAM_DOT  = ${RSDNS_UPSTREAM_DOT:-<unset>}"
-echo "  RSDNS_UPSTREAM_DOH  = ${RSDNS_UPSTREAM_DOH:-<unset>}"
-echo "  RSDNS_UPSTREAM_DOH3 = ${RSDNS_UPSTREAM_DOH3:-<unset>}"
-echo "  RSDNS_UPSTREAM_TCP  = ${RSDNS_UPSTREAM_TCP:-<unset>}"
-echo "  RSDNS_UPSTREAM_DOQ  = ${RSDNS_UPSTREAM_DOQ:-<unset>}"
+echo "Starting rsdns tests with ${RSDNS_E2E_CONFIG:-config.json}..."
 echo "=========================================="
-./test_runner -v
+./test_runner -v -config "${RSDNS_E2E_CONFIG:-config.json}"
 
 EXIT_CODE=$?
 

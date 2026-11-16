@@ -100,14 +100,6 @@ pub struct CacheConfig {
     /// If `true`, preserve the upstream's original TTL (overrides `min_ttl`/`max_ttl`).
     #[serde(default)]
     pub keep_ttl: Option<bool>,
-    /// On a cache hit, whether to skip the `balance` stage's reordering of
-    /// the cached response.  Default `true`: the order was already frozen at
-    /// write-back time (after the first upstream response was balanced), so
-    /// rebalancing is skipped to keep every client's view consistent within a
-    /// TTL.  Set to `false` to re-run `prefers` / `mode` / `max_answers` on
-    /// every cache hit instead of serving the stored order.
-    #[serde(default)]
-    pub skip_balance: Option<bool>,
 }
 
 /// Balance plugin configuration (top-level `balance:` section).
@@ -115,11 +107,8 @@ pub struct CacheConfig {
 /// Reorders A/AAAA answers before they are returned: records whose IP falls
 /// in a `prefers` CIDR are moved to the front (list order = priority), then
 /// an optional `mode` post-pass runs, and `max_answers` caps the total
-/// answer count.  An optional `cloudflare` sub-section replaces answers
-/// inside the built-in Cloudflare ranges with template records (ECH / A /
-/// AAAA).  Disabled entirely when the `balance:` section is absent; see
-/// `docs/design/2026-09-04-rsdns-balance.md` and
-/// `docs/design/2026-11-10-rsdns-balance-cloudflare.md`.
+/// answer count. Disabled when the `balance:` section is absent; see
+/// `docs/design/2026-09-04-rsdns-balance.md`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct BalanceConfig {
     /// Post-pass mode: `none` (default; only `prefers` + `max_answers` run),
@@ -138,19 +127,15 @@ pub struct BalanceConfig {
     /// Parameters for `mode: speed` (read only in that mode).
     #[serde(default)]
     pub speed: Option<BalanceSpeedConfig>,
-    /// Cloudflare template substitution (ECH / A / AAAA); disabled when the
-    /// sub-section is absent.
-    #[serde(default)]
-    pub cloudflare: Option<BalanceCloudflareConfig>,
 }
 
-/// Cloudflare template substitution (`balance.cloudflare`).
+/// Cloudflare template substitution (top-level `cloudflare:` section).
 ///
 /// Each template domain is independent: `ech` enables HTTPS `ech` completion,
 /// `a` enables A-answer substitution, `aaaa` enables AAAA-answer substitution.
 /// Each field is `domain@upstream`, naming its own upstream group.
 #[derive(Debug, Clone, Deserialize)]
-pub struct BalanceCloudflareConfig {
+pub struct CloudflareConfig {
     /// Literal domain whose HTTPS records provide the `ech` template.
     #[serde(default)]
     pub ech: Option<String>,
@@ -263,7 +248,7 @@ pub struct RuleConfig {
     /// error that aborts startup.
     #[serde(default, alias = "r#match")]
     pub r#match: Option<String>,
-    /// Optional query-type filter (`"A"`, `"AAAA"`, `"ANY"`, …).
+    /// Optional comma-separated uppercase query-type filter (`"A, AAAA"`, `"ANY"`, …).
     #[serde(default)]
     pub qtype: Option<String>,
     /// Action to take when this rule matches.
@@ -392,6 +377,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_full_example_config() {
+        let config = Config::from_yaml_str(include_str!("../example/rsdns-all-example.yaml")).unwrap();
+        let balance: BalanceConfig = serde_yaml::from_value(config.plugin_sections["balance"].clone()).unwrap();
+        assert_eq!(balance.mode, "round_robin");
+        let _: CacheConfig = serde_yaml::from_value(config.plugin_sections["cache"].clone()).unwrap();
+        let _: Vec<RuleConfig> = serde_yaml::from_value(config.plugin_sections["rules"].clone()).unwrap();
+    }
+
+    #[test]
     fn test_parse_array_config() {
         let yaml = r#"
 binds:
@@ -414,7 +408,6 @@ upstreams:
         server_name: dns.alidns.com
         pool:
           idle_timeout: 30
-          dns_timeout: 3
           prefer_family: ipv4
   - name: overseas
     mode: parallel
@@ -422,7 +415,7 @@ upstreams:
       - address: tls://8.8.8.8
   - name: cdn
     mode: round_robin
-    cooldown: "1m:10:10s"
+    attempt_timeout: 3
     servers:
       - address: 223.5.5.5
 cache:
@@ -448,7 +441,8 @@ ui:
         assert_eq!(config.upstreams[0].mode, crate::upstream::config::QueryModeConfig::Serial);
         assert_eq!(config.upstreams[1].mode, crate::upstream::config::QueryModeConfig::Parallel);
         assert_eq!(config.upstreams[2].mode, crate::upstream::config::QueryModeConfig::RoundRobin);
-        assert_eq!(config.upstreams[2].cooldown.as_deref(), Some("1m:10:10s"),);
+        assert_eq!(config.upstreams[2].attempt_timeout.get(), 3);
+        assert_eq!(config.upstreams[0].attempt_timeout.get(), 2);
         assert_eq!(config.upstreams[0].servers.len(), 2);
         // Plugin sections land in plugin_sections
         assert!(config.plugin_sections.contains_key("cache"));
@@ -503,34 +497,21 @@ rules:
     }
 
     #[test]
-    fn test_balance_cloudflare_parse() {
-        let yaml = r#"
-balance:
-  cloudflare:
-    ech: "crypto.cloudflare.com@proxy"
-    a: "crypto.cloudflare.com@default"
-    aaaa: "crypto.cloudflare.com@default"
-upstreams: []
-"#;
-        let config = Config::from_yaml_str(yaml).expect("parse failed");
-        let raw = config.plugin_sections.get("balance").cloned().unwrap();
-        let cfg: BalanceConfig = serde_yaml::from_value(raw).unwrap();
-        let cf = cfg.cloudflare.expect("cloudflare section");
+    fn test_cloudflare_parse() {
+        let config = Config::from_yaml_str(
+            "cloudflare:\n  ech: crypto.cloudflare.com@proxy\n  a: crypto.cloudflare.com@default\n  aaaa: crypto.cloudflare.com@default\n",
+        ).unwrap();
+        let raw = config.plugin_sections.get("cloudflare").cloned().unwrap();
+        let cf: CloudflareConfig = serde_yaml::from_value(raw).unwrap();
         assert_eq!(cf.ech.as_deref(), Some("crypto.cloudflare.com@proxy"));
         assert_eq!(cf.a.as_deref(), Some("crypto.cloudflare.com@default"));
         assert_eq!(cf.aaaa.as_deref(), Some("crypto.cloudflare.com@default"));
+        assert!(!config.plugin_sections.contains_key("balance"));
 
-        // Absent → None; a lone `a` does not imply `aaaa`.
-        let config = Config::from_yaml_str("balance:\n  cloudflare:\n    a: a.example\nupstreams: []\n").unwrap();
-        let raw = config.plugin_sections.get("balance").cloned().unwrap();
-        let cfg: BalanceConfig = serde_yaml::from_value(raw).unwrap();
-        let cf = cfg.cloudflare.expect("cloudflare section");
-        assert_eq!(cf.a.as_deref(), Some("a.example"));
+        let cf: CloudflareConfig = serde_yaml::from_str("a: a.example@default").unwrap();
+        assert!(cf.ech.is_none());
         assert!(cf.aaaa.is_none());
-        let config = Config::from_yaml_str("balance:\n  mode: none\nupstreams: []\n").unwrap();
-        let raw = config.plugin_sections.get("balance").cloned().unwrap();
-        let cfg: BalanceConfig = serde_yaml::from_value(raw).unwrap();
-        assert!(cfg.cloudflare.is_none());
+        assert!(!Config::default().plugin_sections.contains_key("cloudflare"));
     }
 
     #[test]
@@ -582,14 +563,13 @@ tls_key: /etc/rsdns/server.key
         let pc = RawPoolConfig {
             idle_timeout: Some(8),
             connect_timeout: Some(4),
-            dns_timeout: Some(3),
             prefer_family: Some("ipv4".into()),
         };
         assert_eq!(pc.prefer_family(), PreferFamily::Ipv4);
         let pool = pc.into_pool_config();
         assert_eq!(pool.idle_timeout, std::time::Duration::from_secs(8));
         assert_eq!(pool.connect_timeout, std::time::Duration::from_secs(4));
-        assert_eq!(pool.dns_timeout, std::time::Duration::from_secs(3));
+        assert_eq!(pool.dns_timeout, crate::upstream::pool::PoolConfig::default().dns_timeout);
         assert_eq!(RawPoolConfig::default().prefer_family(), PreferFamily::Any);
     }
 

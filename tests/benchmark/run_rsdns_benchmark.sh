@@ -22,8 +22,8 @@
 #   stdout 打印 Markdown 摘要表格
 #
 # 说明:
-#   - 通过 cache.size: 0（moka 容量 0 = map 整体禁用）彻底关闭缓存，
-#     规则再叠加 cache: false 双保险；查询路径不触达缓存。
+#   - benchmark group 覆盖 example.com 及 --domains 文件中的域名，
+#     通过 skip_cache: true 跳过缓存查询和写回；cache.size: 0 禁止存储。
 #   - rsdns 同时监听 UDP 与 TCP（同端口），dnspyre 分别用 UDP / TCP（--tcp）
 #     客户端传输测试；上游依次切换各种协议。
 #   - 任一协议失败不影响其余协议，失败行标记 ❌。
@@ -117,15 +117,28 @@ for proto in $PROTO_LIST; do
   fi
 
   cfg="$OUTDIR/rsdns-$proto.yaml"
+  group_domains="    domains: [example.com]"
+  if [ -n "$DOMAINS_FILE" ]; then
+    # file:// paths must be absolute: the server may resolve relative paths elsewhere.
+    group_source="file://$(realpath -- "$DOMAINS_FILE")"
+    group_source="${group_source//\'/\'\'}"  # YAML single-quoted scalar escaping
+    group_domains="    domains: [example.com, '$group_source']"
+  fi
   cat > "$cfg" <<YAML
 binds:
   - address: "0.0.0.0:${PORT}"
   - address: "tcp://0.0.0.0:${PORT}"
+groups:
+  - name: benchmark
+${group_domains}
+    skip_cache: true
 upstreams:
   - name: bootstrap
     servers:
       - address: 223.5.5.5
   - name: default
+    query_timeout: 5
+    attempt_timeout: 2
     servers:
       - address: ${upstream}
         pool:
@@ -136,7 +149,6 @@ rules:
   - action:
       type: forward
       upstream: default
-      cache: false
 YAML
 
   echo "::group::benchmark $proto (upstream=$upstream)" >&2

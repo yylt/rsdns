@@ -1,7 +1,7 @@
 # rsdns balance 承接 Cloudflare 模板替代：`balance.cloudflare`（ech / a / aaaa）
 
 - 日期: 2026-11-10
-- 状态: 已实现
+- 状态: 已被 [2026-11-16 顶级 Cloudflare 提案](2026-11-16-rsdns-cloudflare-group-qtype.md) 取代；以下保留历史设计。Cloudflare 不再属于 balance，也不受 skip_balance 或缓存命中门控。
 - 取代: `2026-09-03-rsdns-forward-cf-ech.md`（规则级 `forward.cloudflare_ech`）
 
 ## 1. 动机
