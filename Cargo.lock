@@ -1508,7 +1508,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "url",
- "x509-parser",
 ]
 
 [[package]]

@@ -82,12 +82,23 @@ rules:
 - 每个上游复用一个多路复用连接，最多 32 个在途请求；建连串行合并，连接空闲超过 `pool.idle_timeout`（默认 30 秒）后在下次使用时替换。
 - 上游组可设置 `query_timeout: 5`（正整数秒，默认 5）：包含排队、建连、请求及所有 fallback 的总预算。这会限制旧版本串行 fallback 可累计的等待时间。
 - 上游组 `attempt_timeout: 2`（正整数秒，默认 2）限制每个 server 的排队、建连锁等待、建连与 DNS 请求；取其与整组剩余预算的较小值。单 server 也适用，超时后有序模式回退到下一 server，parallel 仍首个成功返回。
-- 已删除 group 的 `cooldown` 配置。每个 IP 建连失败或故障连接被淘汰后按 `2 → 4 → 8 → 16 → 32` 秒退避，32 秒封顶；仅 DNS 查询成功重置，退避到期和建连成功不重置。所有地址退避时立即返回不可用，不强制探测；排队超时和主动取消不惩罚 IP。
+- 已删除 group 的 `cooldown` 配置。每个 IP 建连失败或故障连接被淘汰后按 `2 → 4 → 8 → 16 → 32` 秒退避，32 秒封顶；仅收到 SERVFAIL/REFUSED 以外的有效 DNS 响应时重置，退避到期和建连成功不重置。所有地址退避时立即返回不可用，不强制探测；排队/建连锁等待超时和主动取消不惩罚 IP。
 - 每服务器 `pool.connect_timeout` 和内部固定默认 5 秒的 DNS 超时仍是阶段上限（不再支持 `pool.dns_timeout` 配置）；bootstrap 客户端也使用该 DNS 超时限制包含建连的总耗时。Hickory 内部 DoT/DoH TLS 握手另有 5 秒上限，增大外层配置不能放宽它。
-- 连接关闭立即淘汰对应连接；同一连接连续三次请求超时后替换，成功或其他请求结果复位计数。取消查询不计为成功或故障。
+- 每次收到 SERVFAIL/REFUSED 就尝试组内其他 server（serial/random/roundrobin 回退，parallel 继续等待其他 server），不在同一 server 内增加 DNS 重发。全组失败或总预算耗尽时 forward 返回 SERVFAIL，不保留最后一条 REFUSED，也不继续匹配后续规则。
+- 连接关闭立即淘汰并退避；同一连接 generation 内 DNS 查询超时、SERVFAIL、REFUSED 按完成顺序合并累计，连续 3 次失败才淘汰连接并退避对应 IP:port。其他有效响应（包括 NXDOMAIN、NoError 空答案、FORMERR）清零连续计数和地址退避级别；取消、排队/锁等待超时不计数，旧 generation 的迟到结果不影响当前连接健康状态。
 - DoT 入站支持单连接连续查询（串行处理）；DoH3 各请求独立、有界并发。入站 DNS 请求体最多 65535 字节，超限 HTTP 返回 413。
 - 加密入站限制全局 1024 个连接、1024 个在途请求、每连接 32 个请求；握手、消息读取和响应写入预算为 5 秒，DoT 查询间空闲 30 秒后关闭。HTTP 过载返回 503，DoT 关闭连接。
 - H3 单次握手失败不终止监听器；依赖的 H3 accept 仍串行等待握手（最长约 5 秒），本轮未替换依赖。H3 请求头解析包含在不可安全取消的 accept 中，尚无单独读取超时；HTTP/2 也未增加每流请求头计时器。HTTP/1 请求头和 body 分别限制 5 秒，不共享一个预算。
+
+## 上游指标
+
+内置 UI 的上游指标区与 `/metrics` 提供以下互补计数：
+
+| 指标 | 语义 |
+|------|------|
+| `rsdns_upstream_response_failures_total{upstream,proto,rcode}` | 每次 server 尝试实际收到 SERVFAIL/REFUSED 时计数，`rcode` 仅为 `SERVFAIL` / `REFUSED`；后续组内回退成功不掩盖该次失败。旧 generation 的实际失败响应也计数，但不改变当前健康状态。`upstream` 沿用连接池身份，不增加 IP/域名标签。 |
+| `rsdns_upstream_rcode_total{upstream,rcode}` | 整组最终返回的有效 DNS 响应，不是逐 server 计数。 |
+| `rsdns_upstream_error_total{upstream,kind}` | 整组最终失败；回退成功不增加此计数。 |
 
 ## 开发
 

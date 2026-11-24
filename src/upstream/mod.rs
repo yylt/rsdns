@@ -13,8 +13,8 @@
 //! ## Error classification
 //!
 //! `UpstreamClient::query()` returns `io::Result<Message>`.  Errors
-//! (returned as `Err(_)`) indicate that **no valid DNS response was
-//! received** — the caller should retry the next server in the group
+//! (returned as `Err(_)`) indicate transport failure or a retryable
+//! SERVFAIL/REFUSED response — the caller should retry the next server in the group
 //! (`UpstreamGroup`) or return a SERVFAIL to the client.
 //!
 //! Errors that **do** produce `Err` (and thus trigger retry or SERVFAIL):
@@ -28,15 +28,14 @@
 //! | Stream closed      | Multiplexer or QUIC stream terminated | ConnectionAborted, ConnectionReset, UnexpectedEof |
 //! | DNS format         | Wire-format parse error in response | Other |
 //! | Mux queue overflow | Dependency queue full (pool limits requests to 32) | Other |
+//! | DNS response       | SERVFAIL / REFUSED (shares timeout failure streak) | Other |
 //!
 //! Errors that do **not** produce `Err` (they arrive as `Ok(Message)`)
 //! because a valid DNS response was received:
 //!
 //! | DNS rcode       | Meaning                        | Handler responsibility |
 //! |-----------------|--------------------------------|------------------------|
-//! | SERVFAIL        | Upstream resolver failed       | Propagated as-is; caller may return SERVFAIL |
 //! | NXDOMAIN        | Name does not exist            | Cached as negative (NxDomain) in `cache_upstream_response` |
-//! | REFUSED         | Upstream refused the query     | Propagated as-is |
 //! | FORMERR         | Upstream rejected query format | Propagated as-is |
 //! | NoError (empty) | No records of requested type   | Cached as negative (NoData) in `cache_upstream_response` |
 //!
@@ -68,7 +67,7 @@ use ahash::AHashMap;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use hickory_net::xfer::{DnsHandle, FirstAnswer};
-use hickory_proto::op::{DnsRequest, DnsRequestOptions, Edns, Message};
+use hickory_proto::op::{DnsRequest, DnsRequestOptions, Edns, Message, ResponseCode};
 use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsCode, EdnsOption};
 use log::{info, warn};
 use rand::seq::SliceRandom;
@@ -127,6 +126,14 @@ impl UpstreamClient {
             .map_err(|_| query_timeout())
             .and_then(|response| response.map(|m| m.into_message()).map_err(transport_error));
 
+        let result = result.and_then(|message| match message.metadata.response_code {
+            rcode @ (ResponseCode::ServFail | ResponseCode::Refused) => {
+                self.pool.record_response_failure(rcode);
+                Err(io::Error::other(ResponseFailure(rcode)))
+            }
+            _ => Ok(message),
+        });
+
         match result {
             Ok(message) => {
                 guard.record_success();
@@ -139,6 +146,17 @@ impl UpstreamClient {
         }
     }
 }
+
+#[derive(Debug)]
+struct ResponseFailure(ResponseCode);
+
+impl std::fmt::Display for ResponseFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "upstream returned {}", crate::metrics::rcode_label(self.0.into()))
+    }
+}
+
+impl std::error::Error for ResponseFailure {}
 
 fn query_timeout() -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, "upstream query deadline exceeded")
@@ -1104,6 +1122,142 @@ mod tests {
         let mut bytes = [0u8; 512];
         assert!(silent.try_recv_from(&mut bytes).is_ok());
         response_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_response_failure_fallback_and_metrics_all_modes() {
+        let registry = Arc::new(MetricsRegistry::default());
+        let metrics = pool::PoolMetrics::register(&registry);
+        let upstream_metrics = UpstreamMetrics::new(&registry);
+        let mut queries = 0;
+        for rcode in [ResponseCode::ServFail, ResponseCode::Refused] {
+            for (index, mode) in [
+                QueryModeConfig::Serial,
+                QueryModeConfig::Random,
+                QueryModeConfig::RoundRobin,
+                QueryModeConfig::Parallel,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                queries += 1;
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                    let addr = socket.local_addr().unwrap();
+                    let metric = format!(
+                        "rsdns_upstream_response_failures_total{{upstream=\"test\",proto=\"udp\",rcode=\"{}\"}} {}",
+                        crate::metrics::rcode_label(rcode.into()),
+                        index + 1
+                    );
+                    let observed = registry.clone();
+                    let expected = metric.clone();
+                    let server = async move {
+                        let mut bytes = [0u8; 512];
+                        for index in 0..2 {
+                            let (len, peer) = socket.recv_from(&mut bytes).await.unwrap();
+                            let mut response = Message::from_vec(&bytes[..len]).unwrap().into_response();
+                            if index == 0 {
+                                response.metadata.response_code = rcode;
+                            } else {
+                                // Ensure the failed attempt was processed before the parallel winner.
+                                while !observed.encode_text().contains(&expected) {
+                                    tokio::task::yield_now().await;
+                                }
+                            }
+                            socket.send_to(&response.to_vec().unwrap(), peer).await.unwrap();
+                        }
+                    };
+                    let make_client = || {
+                        let pool = ConnectionPool::with_proto(
+                            vec![addr],
+                            factory::udp_factory(),
+                            pool::PoolConfig::default(),
+                            "udp",
+                        );
+                        pool.set_pool_identity("test", &metrics);
+                        UpstreamClient::new(pool)
+                    };
+                    let group = UpstreamGroup::new(
+                        vec![make_client(), make_client()],
+                        mode,
+                        Duration::from_secs(2),
+                        Duration::from_secs(1),
+                    );
+                    let upstreams = Upstreams {
+                        groups: AHashMap::from_iter([("test".into(), group)]),
+                        metrics: UpstreamMetrics {
+                            query_total: upstream_metrics.query_total.clone(),
+                            error_total: upstream_metrics.error_total.clone(),
+                            rcode_total: upstream_metrics.rcode_total.clone(),
+                            latency_seconds: upstream_metrics.latency_seconds.clone(),
+                        },
+                    };
+                    let msg = make_query_msg("example.com", RecordType::A).unwrap();
+                    let (_, response) = tokio::join!(server, upstreams.query("test", &msg));
+                    assert_eq!(response.unwrap().metadata.response_code, ResponseCode::NoError, "{mode:?}");
+                    let text = registry.encode_text();
+                    assert!(text.contains(&metric), "{text}");
+                    assert!(text.contains(&format!(
+                        "rsdns_upstream_rcode_total{{upstream=\"test\",rcode=\"NOERROR\"}} {queries}"
+                    )));
+                    assert!(!text.contains("rsdns_upstream_error_total{upstream="));
+                })
+                .await
+                .unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_response_codes_all_failed_and_non_retryable() {
+        for codes in [
+            vec![ResponseCode::ServFail, ResponseCode::Refused],
+            vec![ResponseCode::NXDomain],
+            vec![ResponseCode::FormErr],
+            vec![ResponseCode::NoError],
+        ] {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let addr = socket.local_addr().unwrap();
+                let clients = codes
+                    .iter()
+                    .map(|_| {
+                        UpstreamClient::new(ConnectionPool::with_proto(
+                            vec![addr],
+                            factory::udp_factory(),
+                            pool::PoolConfig::default(),
+                            "udp",
+                        ))
+                    })
+                    .collect();
+                let group = UpstreamGroup::new(
+                    clients,
+                    QueryModeConfig::Serial,
+                    Duration::from_secs(2),
+                    Duration::from_secs(1),
+                );
+                let server = async {
+                    let mut bytes = [0u8; 512];
+                    for &rcode in &codes {
+                        let (len, peer) = socket.recv_from(&mut bytes).await.unwrap();
+                        let mut response = Message::from_vec(&bytes[..len]).unwrap().into_response();
+                        response.metadata.response_code = rcode;
+                        socket.send_to(&response.to_vec().unwrap(), peer).await.unwrap();
+                    }
+                };
+                let msg = make_query_msg("example.com", RecordType::A).unwrap();
+                let (_, result) = tokio::join!(server, group.query(&msg));
+                if codes.len() == 2 {
+                    let error = result.unwrap_err();
+                    assert!(error.get_ref().unwrap().is::<ResponseFailure>());
+                    assert!(error.to_string().contains("SERVFAIL"));
+                } else {
+                    assert_eq!(result.unwrap().metadata.response_code, codes[0]);
+                }
+            })
+            .await
+            .unwrap();
+        }
     }
 
     #[tokio::test]

@@ -8,6 +8,7 @@
 
 - 启动 rsdns 进程，使用原始 UDP DNS wire-format 查询，验证转发、拦截、缓存、hosts 等核心功能。
 - 生成的转发组显式使用 `query_timeout: 5`（整组）和 `attempt_timeout: 2`（每 server），单位为秒；失败 IP 按 2/4/8/16/32 秒退避，不再配置 group.cooldown。
+- SERVFAIL/REFUSED 每次响应即触发组内回退，与 DNS 查询超时在同一连接 generation 内合并连续失败计数，达到 3 次才淘汰并退避；其他有效响应重置计数及退避。该行为无新增配置字段，现有 E2E / benchmark 生成配置及 CI 临时 JSON 无需调整；确定性失败序列由 Rust 单元测试覆盖，公网 E2E 不依赖上游返回特定失败 rcode。
 
 ## 目录结构
 

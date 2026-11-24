@@ -70,8 +70,19 @@ Rule `qtype` accepts comma-separated uppercase names, e.g. `"A, AAAA, HTTPS"` (O
 
 - Group `query_timeout` defaults to 5 seconds for the entire query and all fallback attempts.
 - Group `attempt_timeout` defaults to 2 seconds per server (positive integer), including capacity/connection-lock waiting, connection establishment and DNS exchange, bounded by the remaining group budget. Applies even to a single server and in parallel mode.
-- Group `cooldown` is removed. Each IP backs off for 2, 4, 8, 16, then at most 32 seconds on connection failure or faulty-connection eviction. Only a successful DNS request resets backoff, not connection establishment or backoff expiry. If all IPs back off, fail fast to group fallback. Queue timeouts and cancellation do not penalize IPs.
-- One shared connection per server and the connection-establishment lock remain; disconnects evict immediately, three consecutive request timeouts evict, and losing parallel queries are cancelled without failure attribution.
+- Group `cooldown` is removed. Each IP backs off for 2, 4, 8, 16, then at most 32 seconds on connection failure or faulty-connection eviction. Only a valid DNS response other than SERVFAIL/REFUSED resets backoff, not connection establishment or backoff expiry. If all IPs back off, fail fast to group fallback. Queue/connection-lock wait timeouts and cancellation do not penalize IPs.
+- Every SERVFAIL/REFUSED response triggers fallback to other servers in the group: serial/random/roundrobin try the next server, while parallel keeps waiting for another server. No additional DNS resend is made within the same server attempt. If all servers fail or the group budget expires, forward returns SERVFAIL, not the last REFUSED, without trying subsequent rules.
+- One shared connection per server and the connection-establishment lock remain. Disconnects evict and back off immediately. Within one connection generation, DNS exchange timeouts, SERVFAIL and REFUSED share a consecutive-failure counter in completion order; 3 consecutive failures evict the connection and back off its IP:port. Other valid responses (including NXDOMAIN, empty NoError and FORMERR) reset the counter and address backoff. Cancellation and queue/lock wait timeouts do not count; late results from an old generation do not affect current connection health.
+
+## Upstream metrics
+
+The built-in UI's upstream section and `/metrics` expose complementary counters:
+
+| Metric | Meaning |
+|--------|---------|
+| `rsdns_upstream_response_failures_total{upstream,proto,rcode}` | Counts every SERVFAIL/REFUSED actually received during a server attempt; `rcode` is limited to `SERVFAIL` / `REFUSED`. Later successful group fallback does not hide the failure. Actual failure responses from old generations still count without affecting current health. `upstream` retains the pool identity; no IP/domain labels are added. |
+| `rsdns_upstream_rcode_total{upstream,rcode}` | Valid DNS responses finally returned by the group, not individual server responses. |
+| `rsdns_upstream_error_total{upstream,kind}` | Final group failures; successful fallback does not increment this counter. |
 
 ## Development
 
