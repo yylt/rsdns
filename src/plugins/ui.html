@@ -243,8 +243,9 @@ const MODULES = [
     color: "var(--upstream)",
     items: [
       { name: "rsdns_upstream_query_total", label: "上游请求", fmt: fmtCount, desc: "转发到各上游池的查询次数", perLabel: "upstream" },
-      { name: "rsdns_upstream_error_total", label: "上游错误", fmt: fmtCount, desc: "上游 transport 错误（按上游分池）", groupBy: "upstream", perLabel: "kind" },
-      { name: "rsdns_upstream_rcode_total", label: "上游 rcode", fmt: fmtCount, desc: "上游应答 rcode 分布（按上游分池）", groupBy: "upstream", perLabel: "rcode" },
+      { name: "rsdns_upstream_error_total", label: "整组最终错误", fmt: fmtCount, desc: "整组最终失败，回退成功不计数（按上游分池）", groupBy: "upstream", perLabel: "kind" },
+      { name: "rsdns_upstream_response_failures_total", label: "逐响应失败（含回退成功）", fmt: fmtCount, desc: "每次实际收到 SERVFAIL/REFUSED 均计数，组内回退成功不掩盖（按上游分池，跨 proto 汇总）", groupBy: "upstream", perLabel: "rcode" },
+      { name: "rsdns_upstream_rcode_total", label: "整组最终 rcode", fmt: fmtCount, desc: "整组最终返回的有效 DNS 响应（按上游分池）", groupBy: "upstream", perLabel: "rcode" },
       { name: "rsdns_upstream_latency_seconds", label: "上游耗时", fmt: fmtSeconds, desc: "各上游池 P50/P95/P99 分布（秒，按上游名）", histogram: true },
       { name: "rsdns_upstream_pool_connections", label: "空闲连接", fmt: fmtInt, desc: "各上游池空闲连接数", perLabel: "upstream" },
       { name: "rsdns_upstream_pool_checkout_total", label: "连接借出", fmt: fmtCount, desc: "连接池借出次数（按上游分池）", groupBy: "upstream", perLabel: "result" },

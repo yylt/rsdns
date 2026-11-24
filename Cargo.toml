@@ -46,7 +46,6 @@ time = { version = "0.3", default-features = false, features = ["formatting", "l
 tokio = { version = "1.49.0", default-features = false, features = ["io-std", "net", "signal", "sync", "time", "fs", "rt-multi-thread", "macros"] }
 tokio-rustls = { version = "0.26", default-features = false }
 url = { version = "2.5", default-features = false }
-x509-parser = { version = "0.18.1", default-features = false }
 
 [features]
 default = ["aws-lc-rs", "jemalloc"]

@@ -44,7 +44,7 @@ impl Default for PoolConfig {
 }
 
 const MAX_IN_FLIGHT: usize = 32;
-const TIMEOUT_FAILURE_THRESHOLD: usize = 3;
+const FAILURE_THRESHOLD: usize = 3;
 
 struct CachedConn {
     sender: Exchange,
@@ -52,7 +52,7 @@ struct CachedConn {
     addr_index: usize,
     last_used: Instant,
     in_flight: usize,
-    consecutive_timeouts: usize,
+    consecutive_failures: usize,
 }
 
 #[derive(Default)]
@@ -141,12 +141,18 @@ pub struct ConnectionPool {
 pub struct PoolMetrics {
     pub pool_connections: crate::metrics::Gauge,
     pub pool_checkout_total: crate::metrics::Counter,
+    pub response_failures_total: crate::metrics::Counter,
 }
 
 impl PoolMetrics {
     /// Registers the pool metric families on `registry`.
     pub fn register(registry: &crate::metrics::MetricsRegistry) -> Arc<Self> {
         Arc::new(Self {
+            response_failures_total: registry.counter(
+                "rsdns_upstream_response_failures_total",
+                "Upstream SERVFAIL and REFUSED responses per server attempt",
+                &["upstream", "proto", "rcode"],
+            ),
             pool_connections: registry.gauge(
                 "rsdns_upstream_pool_connections",
                 "Cached shared connections per upstream pool",
@@ -185,6 +191,17 @@ impl ConnectionPool {
         let identity = self.identity.lock().clone();
         if let (Some(m), Some(name)) = (metrics, identity) {
             m.pool_checkout_total.with_label_values(&[&name, result]).inc();
+        }
+    }
+
+    pub(super) fn record_response_failure(&self, rcode: hickory_proto::op::ResponseCode) {
+        let metrics = self.pool_metrics.lock().clone();
+        let identity = self.identity.lock().clone();
+        if let (Some(metrics), Some(name)) = (metrics, identity) {
+            metrics
+                .response_failures_total
+                .with_label_values(&[&name, self.proto, crate::metrics::rcode_label(rcode.into())])
+                .inc();
         }
     }
 
@@ -290,7 +307,7 @@ impl ConnectionPool {
                         addr_index,
                         last_used: Instant::now(),
                         in_flight: 1,
-                        consecutive_timeouts: 0,
+                        consecutive_failures: 0,
                     });
                     self.update_connection_gauge(&state);
                     self.record_checkout("created");
@@ -345,17 +362,22 @@ impl ConnectionPool {
         let evict = match result {
             None => false,
             Some(Ok(())) => {
-                conn.consecutive_timeouts = 0;
+                conn.consecutive_failures = 0;
                 false
             }
-            Some(Err(error)) if error.kind() == io::ErrorKind::TimedOut => {
+            Some(Err(error))
+                if error.kind() == io::ErrorKind::TimedOut
+                    || error
+                        .get_ref()
+                        .is_some_and(|inner| inner.is::<super::ResponseFailure>()) =>
+            {
                 // Count completion order within this generation. Concurrent
                 // successes reset the streak; old generations never contribute.
-                conn.consecutive_timeouts += 1;
-                conn.consecutive_timeouts >= TIMEOUT_FAILURE_THRESHOLD
+                conn.consecutive_failures += 1;
+                conn.consecutive_failures >= FAILURE_THRESHOLD
             }
             Some(Err(error)) => {
-                conn.consecutive_timeouts = 0;
+                conn.consecutive_failures = 0;
                 matches!(
                     error.kind(),
                     io::ErrorKind::BrokenPipe
@@ -386,7 +408,7 @@ mod tests {
 
     use hickory_net::runtime::TokioRuntimeProvider;
     use hickory_net::xfer::{DnsHandle, FirstAnswer};
-    use hickory_proto::op::{DnsRequest, DnsRequestOptions, Message, Query};
+    use hickory_proto::op::{DnsRequest, DnsRequestOptions, Message, Query, ResponseCode};
     use hickory_proto::rr::{Name, RecordType};
 
     fn pending<F: Future>(future: Pin<&mut F>) {
@@ -463,7 +485,7 @@ mod tests {
         assert_eq!(pool.permits.available_permits(), 0);
         drop(guards);
         assert_eq!(pool.permits.available_permits(), MAX_IN_FLIGHT);
-        assert_eq!(pool.state.lock().connection.as_ref().unwrap().consecutive_timeouts, 0);
+        assert_eq!(pool.state.lock().connection.as_ref().unwrap().consecutive_failures, 0);
     }
 
     #[tokio::test]
@@ -503,28 +525,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timeout_streak_resets_on_success_request_error_but_not_cancellation() {
+    async fn failure_streak_resets_on_success_request_error_but_not_cancellation() {
         let (pool, calls) = counting_pool(PoolConfig::default());
         let timeout = io::Error::from(io::ErrorKind::TimedOut);
-        for _ in 0..2 {
-            pool.checkout(deadline()).await.unwrap().record_failure(&timeout);
+        let servfail = io::Error::other(super::super::ResponseFailure(ResponseCode::ServFail));
+        for error in [&timeout, &servfail] {
+            pool.checkout(deadline()).await.unwrap().record_failure(error);
         }
         drop(pool.checkout(deadline()).await.unwrap());
-        assert_eq!(pool.state.lock().connection.as_ref().unwrap().consecutive_timeouts, 2);
+        assert_eq!(pool.state.lock().connection.as_ref().unwrap().consecutive_failures, 2);
         pool.checkout(deadline()).await.unwrap().record_success();
-        assert_eq!(pool.state.lock().connection.as_ref().unwrap().consecutive_timeouts, 0);
+        assert_eq!(pool.state.lock().connection.as_ref().unwrap().consecutive_failures, 0);
         pool.checkout(deadline()).await.unwrap().record_failure(&timeout);
         pool.checkout(deadline())
             .await
             .unwrap()
             .record_failure(&io::Error::other("HTTP status / stream error"));
-        assert_eq!(pool.state.lock().connection.as_ref().unwrap().consecutive_timeouts, 0);
-        for _ in 0..TIMEOUT_FAILURE_THRESHOLD {
+        assert_eq!(pool.state.lock().connection.as_ref().unwrap().consecutive_failures, 0);
+        for _ in 0..FAILURE_THRESHOLD {
             pool.checkout(deadline()).await.unwrap().record_failure(&timeout);
         }
         assert!(pool.state.lock().connection.is_none());
         expire_backoff(&pool);
         pool.checkout(deadline()).await.unwrap().record_success();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn mixed_failures_back_off_once_and_stale_failures_leave_replacement_unchanged() {
+        let (pool, calls) = counting_pool(PoolConfig::default());
+        let timeout = io::Error::from(io::ErrorKind::TimedOut);
+        let servfail = io::Error::other(super::super::ResponseFailure(ResponseCode::ServFail));
+        let refused = io::Error::other(super::super::ResponseFailure(ResponseCode::Refused));
+        let old_timeout = pool.checkout(deadline()).await.unwrap();
+        let old_response = pool.checkout(deadline()).await.unwrap();
+        for (index, error) in [&timeout, &servfail].into_iter().enumerate() {
+            pool.checkout(deadline()).await.unwrap().record_failure(error);
+            let state = pool.state.lock();
+            assert_eq!(state.connection.as_ref().unwrap().consecutive_failures, index + 1);
+            assert_eq!(state.addresses[0].failure_level, 0);
+            assert!(state.addresses[0].retry_after.is_none());
+        }
+        drop(pool.checkout(deadline()).await.unwrap());
+        pool.checkout(deadline()).await.unwrap().record_failure(&refused);
+        assert!(pool.state.lock().connection.is_none());
+        assert_eq!(pool.state.lock().addresses[0].failure_level, 1);
+        assert!(pool.state.lock().addresses[0].retry_after.is_some());
+        assert!(pool.checkout(deadline()).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        expire_backoff(&pool);
+        let replacement = pool.checkout(deadline()).await.unwrap();
+        let generation = replacement.generation;
+        for error in [&servfail, &refused] {
+            pool.checkout(deadline()).await.unwrap().record_failure(error);
+        }
+        old_timeout.record_failure(&timeout);
+        old_response.record_failure(&refused);
+        {
+            let state = pool.state.lock();
+            let connection = state.connection.as_ref().unwrap();
+            assert_eq!(connection.generation, generation);
+            assert_eq!(connection.consecutive_failures, 2);
+            assert_eq!(connection.in_flight, 1);
+            assert_eq!(state.addresses[0].failure_level, 1);
+        }
+        replacement.record_success();
+        assert_eq!(pool.state.lock().connection.as_ref().unwrap().consecutive_failures, 0);
+        assert_eq!(pool.state.lock().addresses[0].failure_level, 0);
+        assert!(pool.state.lock().addresses[0].retry_after.is_none());
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
